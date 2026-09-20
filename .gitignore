@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.next/
+*.tgz
+test-results/
+playwright-report/
+.test-state.json
+*.tsbuildinfo
+next-env.d.ts

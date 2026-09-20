@@ -1,0 +1,77 @@
+{
+  "name": "@usetemi/live-resource",
+  "version": "0.1.0",
+  "description": "Keep Next.js views current from Postgres notifications over SSE, with authorized snapshot rereads.",
+  "keywords": [
+    "listen",
+    "liveview",
+    "nextjs",
+    "notify",
+    "postgres",
+    "react",
+    "realtime",
+    "sse"
+  ],
+  "homepage": "https://github.com/usetemi/live-resource#readme",
+  "bugs": {
+    "url": "https://github.com/usetemi/live-resource/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/usetemi/live-resource.git"
+  },
+  "files": [
+    "dist",
+    "sql",
+    "LICENSE",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "import": "./dist/server.js"
+    },
+    "./sql/live_resource_notify.sql": "./sql/live_resource_notify.sql"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "oxlint src tests example/src",
+    "format": "oxfmt src tests example/src",
+    "format:check": "oxfmt --check src tests example/src",
+    "static": "npm run format:check && npm run lint && npm run typecheck",
+    "example:install": "rm -f example/*.tgz && npm pack --pack-destination example && cd example && npm ci && npm install --no-save ./usetemi-live-resource-*.tgz",
+    "test": "playwright test",
+    "check": "npm run static && npm run example:install && npm test",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.59.1",
+    "@testcontainers/postgresql": "^12.0.2",
+    "@types/node": "^24.10.0",
+    "@types/pg": "^8.15.0",
+    "@types/react": "^19.2.0",
+    "oxfmt": "^0.50.0",
+    "oxlint": "^1.65.0",
+    "pg": "^8.20.0",
+    "react": "^19.2.5",
+    "typescript": "^5.9.3"
+  },
+  "peerDependencies": {
+    "pg": "^8",
+    "react": ">=19.2"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
