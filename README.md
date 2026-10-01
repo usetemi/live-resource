@@ -15,6 +15,33 @@ browser ── GET /api/tasks ──▶ your authorized Route Handler ──▶ 
 
 It assumes Next.js 16, React 19.2, Node.js 22, and Postgres 14, or newer. There are no adapters for other frameworks, runtimes, or databases.
 
+## Design
+
+live-resource is pubsub for server-rendered views, in the shape of Phoenix Channels: a browser joins topics, the server broadcasts that a topic changed, and the view rereads from the server. The server stays the only place data is assembled, and the browser holds nothing but what the view is showing.
+
+**Model.**
+
+- A **topic** is a `name` and an optional `key`: `tasks`, or `tasks` with key `42`. A name is a projection, not a table; any number of tables publish to it through triggers, and a trigger on a table with a row key publishes to the keyed topic. A hint without a key reaches every join on that name, keyed or not, because a keyed view may depend on a side table that has no key for it.
+- A **join** is per topic and answered per topic. `authorize` receives every topic a tab asks for in one call, on open, before a hint is forwarded, and on every heartbeat, and returns the ones it admits. A denied topic fails alone; the rest of the stream continues.
+- A **hint** is the whole payload: topic changed. No row data crosses the stream. The view reads through its own authorized server path, which may be a Route Handler, a server-component refresh, or a delta feed. A read may carry an opaque cursor the server path defines; the library passes it through and never holds a log.
+- **The browser owns its topic set.** One stream per tab carries the full set, opened by POST and reopened with the full set when it changes. Any server process can serve any open, so a stream never needs to find the process that served the previous one.
+
+**Accepted tradeoffs.**
+
+- A reread per hint, not a diff. Keys limit which views reread; a cursor can make a read cheap; the library still never carries data it cannot authorize.
+- Reopening the stream to add a topic, instead of a subscribe message. The stream is one-way so that it stays a plain `Request → Response` handler, with no custom server, no sticky routing, and no second channel.
+- A `topics` list declared at startup and checked against the installed triggers on connect. A projection's tables are listed twice, once in SQL and once here, so the mismatch fails loudly instead of as a stale view.
+- Postgres `NOTIFY` as the only broker. It needs a direct connection and delivers at most once; a missed hint is repaired by the next `ready`, so nothing is lost that a reread cannot recover.
+
+**Rejected.**
+
+- *Sync engines (Electric, Zero).* They move tables and queries into the browser; here views are assembled on the server and sensitive rows should not be cached in a browser.
+- *WebSocket.* Needs a custom server, which standalone Next.js output does not allow, and its one benefit here, an in-band subscribe, is matched by reopening the stream.
+- *Pinning a client to one machine.* Would let the server hold the topic set as the source of truth, at the cost of a platform-specific routing dependency in a public library.
+- *A library-owned notifications table.* Buys replay, which a full reread already provides, and costs a schema, retention, and upgrade migrations in every consumer's database.
+- *Payloads on the wire.* A broadcast that carries data is data the stream cannot authorize per row.
+- *Topics encoded in the name (`tasks:42`).* The library has to split name from key anyway; putting the key in the name moves the encoding into every trigger and call site.
+
 ## Install
 
 ```sh
