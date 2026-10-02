@@ -71,7 +71,7 @@ FOR EACH ROW EXECUTE FUNCTION live_resource_notify('tasks', 'task_id');
 
 A topic names a projection, not a table. If the `tasks` view joins `users`, put a `live_resource_notify('tasks')` trigger on `users` too; without a key column it publishes a keyless hint, which every join on `tasks` hears. The library does not infer dependencies. Names match `^[a-z][a-z0-9_]{0,63}$`.
 
-The key is the column's value as `to_jsonb` renders it, compared as text: a uuid is lowercase, a number has no quotes. An `INSERT` publishes the new row's key, a `DELETE` the old row's, and an `UPDATE` that moves a row between keys publishes both. A row whose key column is null publishes nothing, and so does a trigger naming a column the table lacks; the server reports the latter when it connects.
+The key is the column's value as `to_jsonb` renders it, compared as text: a uuid is lowercase, a number has no quotes. An `INSERT` publishes the new row's key, a `DELETE` the old row's, and an `UPDATE` that moves a row between keys publishes both. A row whose key column is null publishes nothing, and so does a trigger naming a column the table lacks; the server reports the latter when it connects. A key the stream cannot carry, empty, longer than 256 characters, or holding a control character, arrives as a keyless hint instead.
 
 Postgres delivers the notification only after commit and drops it on rollback. Identical notifications within one transaction are coalesced, and the function skips updates that change nothing.
 

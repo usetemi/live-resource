@@ -11,13 +11,13 @@ export function encodeTopic({ name, key }: LiveResourceTopic): string {
   return key === undefined ? name : `${name} ${key}`;
 }
 
+/** A notification's topic. A key the stream cannot carry leaves a keyless hint, which every join on the name hears. */
 export function decodeTopic(text: string): LiveResourceTopic | undefined {
   const boundary = text.indexOf(" ");
-  const topic: LiveResourceTopic =
-    boundary === -1
-      ? { name: text }
-      : { name: text.slice(0, boundary), key: text.slice(boundary + 1) };
-  return isTopic(topic) ? topic : undefined;
+  const name = boundary === -1 ? text : text.slice(0, boundary);
+  if (!TOPIC_NAME.test(name)) return undefined;
+  const key = boundary === -1 ? undefined : text.slice(boundary + 1);
+  return key !== undefined && TOPIC_KEY.test(key) ? { name, key } : { name };
 }
 
 export function isTopic(value: unknown): value is LiveResourceTopic {

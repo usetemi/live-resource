@@ -13,7 +13,9 @@
 -- With one, INSERT publishes NEW's key, DELETE publishes OLD's, and an UPDATE
 -- that moves a row between keys publishes both. A null key publishes nothing,
 -- and so does a column the table lacks; the server reports the latter from
--- pg_trigger when it connects. The key is the column as to_jsonb renders it.
+-- pg_trigger when it connects. The key is the column as to_jsonb renders it;
+-- one the stream cannot carry (empty, over 256 characters, or holding a control
+-- character) is forwarded keyless instead, so no join misses the change.
 --
 -- Postgres delivers the notification only after commit, drops it on rollback,
 -- and coalesces identical notifications within one transaction.
@@ -36,11 +38,13 @@ BEGIN
   IF TG_OP <> 'DELETE' THEN
     new_key := to_jsonb(NEW) ->> TG_ARGV[1];
   END IF;
+  -- Cut past the 256 the server carries, so a long key stays under the 8000-byte
+  -- NOTIFY limit instead of failing the write, and still arrives as keyless.
   IF old_key IS NOT NULL THEN
-    PERFORM pg_notify('live_resource', TG_ARGV[0] || ' ' || old_key);
+    PERFORM pg_notify('live_resource', TG_ARGV[0] || ' ' || left(old_key, 257));
   END IF;
   IF new_key IS NOT NULL AND new_key IS DISTINCT FROM old_key THEN
-    PERFORM pg_notify('live_resource', TG_ARGV[0] || ' ' || new_key);
+    PERFORM pg_notify('live_resource', TG_ARGV[0] || ' ' || left(new_key, 257));
   END IF;
   RETURN NULL;
 END;

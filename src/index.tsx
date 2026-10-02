@@ -74,6 +74,12 @@ export function useTopic(
   const runtime = useRuntime();
   const join = useRef<Join | undefined>(undefined);
   const latest = useEffectEvent((signal: AbortSignal) => read(signal));
+  // Subscribed to status before the join exists, so the join's first publish is heard.
+  const status = useSyncExternalStore(
+    runtime.subscribeStatus,
+    (): LiveTopicStatus => join.current?.getStatus() ?? "reconnecting",
+    (): LiveTopicStatus => "reconnecting"
+  );
 
   useEffect(() => {
     const current = runtime.subscribe({ name, key }, (signal) => latest(signal));
@@ -84,11 +90,6 @@ export function useTopic(
     };
   }, [runtime, name, key]);
 
-  const status = useSyncExternalStore(
-    runtime.subscribeStatus,
-    (): LiveTopicStatus => join.current?.getStatus() ?? "reconnecting",
-    (): LiveTopicStatus => "reconnecting"
-  );
   const [refresh] = useState(() => () => join.current?.refresh());
   return { status, refresh };
 }

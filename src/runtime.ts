@@ -82,7 +82,8 @@ export function createRuntime(endpoint: string) {
         publishStatus();
       }
     } catch {
-      if (subscriptions.has(subscription)) scheduleReconnect();
+      // A read aborted by a denial of its own join is not a broken stream.
+      if (subscriptions.has(subscription) && !denied.has(subscription.encoded)) scheduleReconnect();
     } finally {
       subscription.controller = undefined;
     }
