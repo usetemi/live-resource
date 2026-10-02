@@ -17,12 +17,16 @@ It assumes Next.js 16, React 19.2, Node.js 22, and Postgres 14, or newer. There 
 
 ## Design
 
+This section describes 0.2, which is not released. The sections after it document the installed 0.1.
+
 live-resource is pubsub for server-rendered views, in the shape of Phoenix Channels: a browser joins topics, the server broadcasts that a topic changed, and the view rereads from the server. The server stays the only place data is assembled, and the browser holds nothing but what the view is showing.
 
 **Model.**
 
-- A **topic** is a `name` and an optional `key`: `tasks`, or `tasks` with key `42`. A name is a projection, not a table; any number of tables publish to it through triggers, and a trigger on a table with a row key publishes to the keyed topic. A hint without a key reaches every join on that name, keyed or not, because a keyed view may depend on a side table that has no key for it.
-- A **join** is per topic and answered per topic. `authorize` receives every topic a tab asks for in one call, on open, before a hint is forwarded, and on every heartbeat, and returns the ones it admits. A denied topic fails alone; the rest of the stream continues.
+- A **topic** is a `name` and an optional `key`: `tasks`, or `tasks` with key `42`. A name is a projection, not a table; any number of tables publish to it through triggers, and a trigger that names a key column publishes to the keyed topic. A row whose key column is null publishes nothing.
+- A name belongs to **one audience**. When two audiences see different slices of the same rows, a staff inbox and each customer's own page, each is its own name with its own trigger on the shared table and its own key column, rather than one name whose admission depends on who is asking.
+- The key **narrows**. A join without a key hears every hint on its name; a join with a key hears hints for that key and hints without a key. A keyless hint exists for a side table that has no key for the view, so a side table that an audience-scoped name depends on should publish with that audience's key, or every join on the name learns that something changed.
+- A **join** is per topic and answered per topic. `authorize` receives every topic a tab asks for in one call, on open, before a hint is forwarded, and on every heartbeat, and returns the ones it admits. It decides by name and key, never by the caller's role for a shared name. A denied topic fails alone, the rest of the stream continues, and the next heartbeat asks again.
 - A **hint** is the whole payload: topic changed. No row data crosses the stream. The view reads through its own authorized server path, which may be a Route Handler, a server-component refresh, or a delta feed. A read may carry an opaque cursor the server path defines; the library passes it through and never holds a log.
 - **The browser owns its topic set.** One stream per tab carries the full set, opened by POST and reopened with the full set when it changes. Any server process can serve any open, so a stream never needs to find the process that served the previous one.
 
@@ -30,7 +34,8 @@ live-resource is pubsub for server-rendered views, in the shape of Phoenix Chann
 
 - A reread per hint, not a diff. Keys limit which views reread; a cursor can make a read cheap; the library still never carries data it cannot authorize.
 - Reopening the stream to add a topic, instead of a subscribe message. The stream is one-way so that it stays a plain `Request → Response` handler, with no custom server, no sticky routing, and no second channel.
-- A `topics` list declared at startup and checked against the installed triggers on connect. A projection's tables are listed twice, once in SQL and once here, so the mismatch fails loudly instead of as a stale view.
+- A `topics` list declared at startup and checked against the installed triggers on every connect. A projection's tables are listed twice, once in SQL and once here; a declared name with no trigger, a trigger whose name is not declared, or a trigger naming a column the table lacks, is logged as a warning and the server keeps serving, so the mismatch is visible instead of only a stale view.
+- Two triggers on a table that two audiences read. Each write notifies once per name; the price of one admission policy per name.
 - Postgres `NOTIFY` as the only broker. It needs a direct connection and delivers at most once; a missed hint is repaired by the next `ready`, so nothing is lost that a reread cannot recover.
 
 **Rejected.**
@@ -40,6 +45,7 @@ live-resource is pubsub for server-rendered views, in the shape of Phoenix Chann
 - *Pinning a client to one machine.* Would let the server hold the topic set as the source of truth, at the cost of a platform-specific routing dependency in a public library.
 - *A library-owned notifications table.* Buys replay, which a full reread already provides, and costs a schema, retention, and upgrade migrations in every consumer's database.
 - *Payloads on the wire.* A broadcast that carries data is data the stream cannot authorize per row.
+- *One name admitting two audiences by role.* `authorize` would have to inspect the session to decide which keys a caller may hear, and the README would have to specify that policy; two names give each audience one policy and one trigger.
 - *Topics encoded in the name (`tasks:42`).* The library has to split name from key anyway; putting the key in the name moves the encoding into every trigger and call site.
 
 ## Install
