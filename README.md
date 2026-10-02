@@ -71,9 +71,11 @@ FOR EACH ROW EXECUTE FUNCTION live_resource_notify('tasks', 'task_id');
 
 A topic names a projection, not a table. If the `tasks` view joins `users`, put a `live_resource_notify('tasks')` trigger on `users` too; without a key column it publishes a keyless hint, which every join on `tasks` hears. The library does not infer dependencies. Names match `^[a-z][a-z0-9_]{0,63}$`.
 
+A read must not write a table that publishes its own topic. Before attaching a trigger, check everything a hint causes to run: the Route Handler the read fetches, a server component a hint re-renders, and what they call. If any of it writes that table, the write hints the join, the hint runs the read, and the read writes again, with no pause between rounds. Write a table that carries no trigger for the topic instead, or leave the trigger off and give the view another way to move on.
+
 The key is the column's value as `to_jsonb` renders it, compared as text: a uuid is lowercase, a number has no quotes. An `INSERT` publishes the new row's key, a `DELETE` the old row's, and an `UPDATE` that moves a row between keys publishes both. A row whose key column is null publishes nothing, and so does a trigger naming a column the table lacks; the server reports the latter when it connects. A key the stream cannot carry, empty, longer than 256 characters, or holding a control character, arrives as a keyless hint instead.
 
-Postgres delivers the notification only after commit and drops it on rollback. Identical notifications within one transaction are coalesced, and the function skips updates that change nothing. The trigger must be `AFTER`, and `FOR EACH ROW` when it names a key column; the function raises otherwise. Row triggers do not fire on `TRUNCATE`; where a view must hear one, add a keyless `AFTER TRUNCATE ... FOR EACH STATEMENT` trigger.
+Postgres delivers the notification only after commit and drops it on rollback. Identical notifications within one transaction are coalesced, and the function skips updates that change nothing. An update that changes any column publishes, including one that only bumps `updated_at`. The trigger must be `AFTER`, and `FOR EACH ROW` when it names a key column; the function raises otherwise. Row triggers do not fire on `TRUNCATE`; where a view must hear one, add a keyless `AFTER TRUNCATE ... FOR EACH STATEMENT` trigger.
 
 ### 2. The stream endpoint
 
@@ -107,7 +109,7 @@ export const POST = (request: Request) => live.handle(request);
 
 - `connectionString` must be a direct connection. `LISTEN` does not survive transaction pooling. Your ordinary queries can keep using a pooled one.
 - `topics` is every name a browser may join. Each time the listener connects, the server compares the list with the installed `live_resource_notify` triggers and logs a `trigger_mismatch` warning for each disagreement. It keeps serving.
-- `authorize` runs when a stream opens, before a hint is forwarded, and on every heartbeat, with every topic the stream asked for, and returns the ones it admits. Decide by name and key: a customer may join `orders` with their own id as the key and nothing else. Read current access from your session store or database rather than trusting a cached session: this callback is what ends a join after access is revoked.
+- `authorize` runs when a stream opens, before a hint is forwarded, and on every heartbeat, with every topic the stream asked for, and returns the ones it admits. Decide by name and key: a customer may join `orders` with their own id as the key and nothing else. Read current access from your session store or database rather than trusting a cached session: this callback is what ends a join after access is revoked. Keep it cheap: it runs for every open stream on each of those occasions, and a heartbeat comes every 15 seconds. Read each fact once per call rather than once per topic, and skip reads no asked topic needs.
 - `log` is optional. Without it nothing is logged.
 - Call `live.close()` during shutdown. It ends the listener and every open stream, and `handle` answers 503 afterwards.
 
@@ -210,7 +212,7 @@ Returns `{ status, retry }` for the tab's shared stream.
 | `reconnecting` | The stream, the database listener, or a read was interrupted. It clears only after every admitted join catches up. |
 | `unauthorized` | The open was refused, or every join is denied. Automatic retries of a refused open have stopped; a 400, which is a configuration error, is reported the same way with the reason in the console. |
 
-`retry` reopens the stream and catches up without navigating, so unsaved page state survives. Offer it with a way to sign in again.
+`retry` reopens the stream and catches up without navigating, so unsaved page state survives. Offer it with a way to sign in again. A denied join never reads, so a view whose only way forward is its read stays where it is while it is `unauthorized`. Every route that mounts a live view needs to show that state, through a shared status indicator or in the view itself.
 
 ### `createLiveResourceServer({ connectionString, topics, authorize, log? })`
 
@@ -225,17 +227,27 @@ Upgrading from 0.1:
 - `useSnapshot` is gone. The view keeps its own state and joins with `useTopic`; a new server-rendered value is not applied to a mounted view, so remount with a `key` or call `refresh()` where the selection changes.
 - The 0.1 browser opens with `GET`. Route `GET` to `handle` as well until no such tab is left; the 400 it answers stops that client's retries.
 
+## Agent rules
+
+The package ships [`usage-rules.md`](usage-rules.md): the rules above as short directives for a coding agent, installed at `node_modules/@usetemi/live-resource/usage-rules.md` so they always match the installed version. To keep an agent pointed at it:
+
+```sh
+npx live-resource agent-rules AGENTS.md src/live/AGENTS.md
+```
+
+The command writes a marked block that points at the file into each path it is given. It replaces an existing block where it stands, appends one to a file that has none, creates a file that does not exist, and changes nothing outside the markers. It runs only when you run it. `--check` writes nothing and exits 1 when a file's block is missing or out of date, which suits CI. Any other failure, such as a file holding one marker without the other or a path that cannot be read, exits 2 and writes nothing.
+
 ## How it behaves
 
 **One stream per tab, one listener per process.** Every `useTopic` in a tab shares one SSE connection, and every stream in a server process shares one dedicated Postgres connection. The first join to a topic the stream does not carry reopens it with the full set. Joining a carried topic again only reads.
 
-**Join, then read.** The server sends `ready` only after `LISTEN` has committed, and the browser reads only after `ready`. A change that lands between the server render and the join is therefore picked up by the first read rather than lost. The same holds after every reconnection.
+**Join, then read.** The server sends `ready` only after `LISTEN` has committed, and the browser reads only after `ready`. A change that lands between the server render and the join is therefore picked up by the first read rather than lost. The same holds after every reconnection. In a browser test, a row written before the join is ready reaches the view through that first read, not through a hint; a test that means to prove a hint waits for the `connected` status before it writes. The stream endpoint's response arrives before the server is listening, so it is not that signal.
 
 **Denied joins never read.** A refused topic is announced before `ready` and before any hint, so the browser does not catch up on a join whose own read would be refused. Every heartbeat asks `authorize` again and announces what changed; a join admitted later reads once, and a join denied later stops.
 
 **Hints are forwarded per join.** A notification marks the admitted joins it reaches, and the stream sends one `invalidate` per marked join, so a bulk update that publishes thousands of keys costs a keyless join one frame.
 
-**Reads are serialized per join.** A hint that arrives during a read marks the join dirty, and exactly one more read follows. A read is aborted after 30 seconds, and its lock is held until it settles, so a late completion cannot overlap its retry. A failed read reopens the stream before reading again, with a backoff that resets only when a read lands, so one route that keeps failing is retried slower and slower rather than twice a second.
+**Reads are serialized per join.** A hint that arrives during a read marks the join dirty, and exactly one more read follows. A read is aborted after 30 seconds, and its lock is held until it settles, so a late completion cannot overlap its retry. A failed read reopens the stream before reading again, with a backoff that resets only when a read lands, so one route that keeps failing is retried slower and slower rather than twice a second. That backoff applies only to a read that failed: a hint runs the read at once. If a read starts or resumes work on the server, and the work records its failure in a row that publishes the topic, the failure's hint runs the read and the work again immediately, so the server must space those retries itself.
 
 **Recovery is split.** The server owns the database listener: it probes the connection, reconnects with backoff, and keeps browser streams open while it does, telling them `interrupted` and then `ready`. The browser owns the stream: it reconnects with backoff and treats 45 seconds of silence as a dead connection.
 
@@ -250,6 +262,7 @@ These values are fixed. The protocol, including the `live_resource` channel and 
 - **Not a durable log.** Notifications are hints to reread. A missed hint is repaired by the next `ready`, not replayed.
 - **Not exactly-once.** A burst of changes may produce one read or several.
 - **Not a job queue.** Do not run commands or background work from a hint.
+- **Not a clock or a webhook.** A hint announces a committed row write on a table with a trigger, and nothing else. A view that waits on an external system, on the passage of time, or on a table with no trigger hears nothing for that change and needs its own exit: a timer, or a control the user can press.
 - **Not a diff protocol.** The library carries no data. A read may fetch a snapshot or a delta from a cursor the view holds; either way the view applies it.
 - **Not a write path.** Use Server Actions. Reads deliberately do not use them: Next.js dispatches Server Actions one at a time per client, so a background reread would queue ahead of the user's next mutation; action IDs change between deployments, which breaks a tab that stays open across a deploy; and an action cannot be aborted. A Route Handler URL is stable, parallel, and cancelable.
 
