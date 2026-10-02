@@ -91,6 +91,19 @@ test("--check names each file that is missing or stale and writes nothing", () =
   expect(existsSync(join(dir, "absent.md"))).toBe(false);
 });
 
+test("a marker without its pair is refused and no file in the call is written", () => {
+  const dir = mkdtempSync(join(tmpdir(), "agent-rules-"));
+  writeFileSync(join(dir, "first.md"), "# First\n");
+  const broken = `${BEGIN}\nold words\n\n# Mine\n`;
+  writeFileSync(join(dir, "broken.md"), broken);
+
+  const refused = run(dir, "first.md", "broken.md");
+  expect(refused.status).toBe(2);
+  expect(refused.output).toContain("broken.md");
+  expect(readFileSync(join(dir, "broken.md"), "utf8")).toBe(broken);
+  expect(readFileSync(join(dir, "first.md"), "utf8")).toBe("# First\n");
+});
+
 test("a call without a file to write is refused with the usage text", () => {
   const dir = mkdtempSync(join(tmpdir(), "agent-rules-"));
 

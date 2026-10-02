@@ -18,15 +18,18 @@ replacing an existing block and leaving everything outside the markers alone.
 A file that does not exist is created. --check writes nothing and exits 1 when a
 file's block is missing or out of date.`;
 
-/** `text` with the block current: replaced between its markers, or appended when it has none. */
-function withBlock(text: string): string {
+/**
+ * `text` with the block current: replaced between its markers, or appended when it
+ * has none. Undefined for a marker without its pair, where replacing or appending
+ * would discard text the block does not own.
+ */
+function withBlock(text: string): string | undefined {
   const eol = text.includes("\r\n") ? "\r\n" : "\n";
   const block = BLOCK.join(eol);
   const begin = text.indexOf(BEGIN);
-  const end = text.indexOf(END, begin);
-  if (begin !== -1 && end !== -1) {
-    return text.slice(0, begin) + block + text.slice(end + END.length);
-  }
+  const end = text.indexOf(END, Math.max(begin, 0));
+  if ((begin === -1) !== (end === -1)) return undefined;
+  if (begin !== -1) return text.slice(0, begin) + block + text.slice(end + END.length);
   if (text === "") return block + eol;
   return text + (text.endsWith(eol) ? "" : eol) + eol + block + eol;
 }
@@ -39,18 +42,30 @@ if (command !== "agent-rules" || files.length === 0 || files.some((file) => file
   process.exit(2);
 }
 
-const stale: string[] = [];
+// Every file is read and decided before any is written, so a refusal leaves all of them alone.
+const stale: [file: string, next: string][] = [];
 for (const file of files) {
   const current = existsSync(file) ? readFileSync(file, "utf8") : "";
   const next = withBlock(current);
-  if (next === current) continue;
-  stale.push(file);
-  if (!check) writeFileSync(file, next);
+  if (next === undefined) {
+    console.error(
+      `${file}: has one live-resource-agent-rules marker without the other; fix it by hand`
+    );
+    process.exit(2);
+  }
+  if (next !== current) stale.push([file, next]);
 }
-if (check && stale.length > 0) {
-  for (const file of stale)
+if (check) {
+  for (const [file] of stale) {
     console.error(`${file}: live-resource agent rules are missing or out of date`);
-  console.error(`Run: npx live-resource agent-rules ${stale.join(" ")}`);
-  process.exit(1);
+  }
+  if (stale.length > 0) {
+    console.error(`Run: npx live-resource agent-rules ${stale.map(([file]) => file).join(" ")}`);
+    process.exit(1);
+  }
+} else {
+  for (const [file, next] of stale) {
+    writeFileSync(file, next);
+    console.log(`${file}: updated`);
+  }
 }
-for (const file of stale) console.log(`${file}: updated`);
