@@ -1,6 +1,6 @@
 "use client";
 
-import { LiveResourceProvider, useSnapshot, useStatus } from "@usetemi/live-resource";
+import { LiveResourceProvider, readFrom, useStatus, useTopic } from "@usetemi/live-resource";
 import { useState, type ReactNode } from "react";
 
 import type { Note, Task } from "@/db";
@@ -15,18 +15,25 @@ export function Status() {
   const { status, retry } = useStatus();
   return (
     <p>
-      Live updates: <output>{status}</output>{" "}
+      Live updates: <output aria-label="Stream status">{status}</output>{" "}
       {status === "unauthorized" && <button onClick={retry}>Retry</button>}
     </p>
   );
 }
 
+// The server-rendered rows are the initial state; the join keeps them current.
 export function Tasks({ initial }: { initial: Task[] }) {
-  const tasks = useSnapshot("tasks", { initial, url: "/api/tasks" });
+  const [tasks, setTasks] = useState(initial);
+  const { status } = useTopic(
+    "tasks",
+    readFrom("/api/tasks", async (response) => setTasks(await response.json()))
+  );
   const [filter, setFilter] = useState("");
   return (
     <section aria-label="Tasks">
-      <h2>Tasks</h2>
+      <h2>
+        Tasks <output aria-label="Tasks status">{status}</output>
+      </h2>
       <input
         aria-label="Filter tasks"
         value={filter}
@@ -52,8 +59,13 @@ export function Tasks({ initial }: { initial: Task[] }) {
   );
 }
 
-export function Notes({ initial }: { initial: Note[] }) {
-  const notes = useSnapshot("notes", { initial, url: "/api/notes" });
+// A keyed join: this tab hears only its own viewer's notes.
+export function Notes({ viewer, initial }: { viewer: string; initial: Note[] }) {
+  const [notes, setNotes] = useState(initial);
+  useTopic(
+    { name: "notes", key: viewer },
+    readFrom("/api/notes", async (response) => setNotes(await response.json()))
+  );
   return (
     <section aria-label="Notes">
       <h2>Notes</h2>

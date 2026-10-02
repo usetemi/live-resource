@@ -13,12 +13,14 @@ import {
 
 import {
   createRuntime,
-  RESOURCE_NAME,
+  type LiveResourceRead,
   type LiveResourceRuntime,
   type LiveResourceStatus,
+  type LiveTopicStatus,
 } from "./runtime.js";
+import { isTopic, type LiveResourceTopic } from "./topic.js";
 
-export type { LiveResourceStatus };
+export type { LiveResourceRead, LiveResourceStatus, LiveResourceTopic, LiveTopicStatus };
 
 const RuntimeContext = createContext<LiveResourceRuntime | undefined>(undefined);
 
@@ -40,67 +42,60 @@ export function LiveResourceProvider({
   return <RuntimeContext value={runtime}>{children}</RuntimeContext>;
 }
 
-export type SnapshotOptions<T> = {
-  /** The server-rendered snapshot. A new value renders immediately and schedules a catch-up read. */
-  initial: T;
-  /** An authorized Route Handler that answers the current snapshot as JSON. */
-  url: string;
-  /** Turns the parsed JSON into `T`; throw to reject a snapshot. Defaults to a cast. */
-  decode?: (json: unknown) => T;
-};
-
 /**
- * Keeps `initial` current. The data on screen is replaced only by a complete,
- * decoded snapshot; a failed or canceled read retains it and never navigates.
+ * A read that fetches `url` with `cache: "no-store"` and hands the response to
+ * `receive`, which applies it; a response that is not `ok` rejects the read.
  */
-export function useSnapshot<T>(resource: string, { initial, url, decode }: SnapshotOptions<T>): T {
-  if (!RESOURCE_NAME.test(resource)) throw new Error(`Invalid live resource name: ${resource}`);
-  const runtime = useRuntime();
-  const [frame, setFrame] = useState({ initial, url, data: initial });
-  const committed = useRef<{ frame: typeof frame; resolve: () => void } | undefined>(undefined);
-  const subscription = useRef<ReturnType<LiveResourceRuntime["subscribe"]> | undefined>(undefined);
-
-  // A read completes once React has committed its snapshot.
-  useEffect(() => {
-    if (committed.current?.frame !== frame) return;
-    committed.current.resolve();
-    committed.current = undefined;
-  }, [frame]);
-
-  const read = useEffectEvent(async (signal: AbortSignal) => {
+export function readFrom(
+  url: string,
+  receive: (response: Response) => void | Promise<void>
+): LiveResourceRead {
+  return async (signal) => {
     const response = await fetch(url, { signal, cache: "no-store" });
-    if (!response.ok) throw new Error(`Snapshot read failed: ${response.status}`);
-    const json: unknown = await response.json();
-    const next = { initial, url, data: decode ? decode(json) : (json as T) };
-    signal.throwIfAborted();
-    await new Promise<void>((resolve) => {
-      committed.current = { frame: next, resolve };
-      signal.addEventListener("abort", () => resolve(), { once: true });
-      setFrame(next);
-    });
-  });
-
-  useEffect(() => {
-    const current = runtime.subscribe(resource, (signal) => read(signal));
-    subscription.current = current;
-    return () => {
-      subscription.current = undefined;
-      current.unsubscribe();
-    };
-  }, [runtime, resource]);
-
-  // A navigation's server snapshot may predate a hint this tab already consumed.
-  const seen = useRef({ initial, url });
-  useEffect(() => {
-    if (seen.current.initial === initial && seen.current.url === url) return;
-    seen.current = { initial, url };
-    subscription.current?.refresh();
-  }, [initial, url]);
-
-  return frame.initial === initial && frame.url === url ? frame.data : initial;
+    if (!response.ok) throw new Error(`Read failed: ${response.status}`);
+    await receive(response);
+  };
 }
 
-/** Status of the shared stream. `retry` resubscribes and catches up without navigating. */
+type Join = ReturnType<LiveResourceRuntime["subscribe"]>;
+
+/**
+ * Join a topic and run `read` when it changes: once after the stream is ready,
+ * on every hint for it, and after every reconnection. The latest `read` is
+ * always the one called, so it may close over current props and state. Reads
+ * for one join never overlap; a hint during a read causes exactly one more.
+ */
+export function useTopic(
+  topic: string | LiveResourceTopic,
+  read: LiveResourceRead
+): { status: LiveTopicStatus; refresh: () => void } {
+  const { name, key } = typeof topic === "string" ? { name: topic } : topic;
+  if (!isTopic({ name, key })) {
+    throw new Error(`Invalid live resource topic ${JSON.stringify({ name, key })}`);
+  }
+  const runtime = useRuntime();
+  const join = useRef<Join | undefined>(undefined);
+  const latest = useEffectEvent((signal: AbortSignal) => read(signal));
+  const status = useSyncExternalStore(
+    runtime.subscribeStatus,
+    (): LiveTopicStatus => runtime.getTopicStatus({ name, key }),
+    (): LiveTopicStatus => "reconnecting"
+  );
+
+  useEffect(() => {
+    const current = runtime.subscribe({ name, key }, (signal) => latest(signal));
+    join.current = current;
+    return () => {
+      join.current = undefined;
+      current.unsubscribe();
+    };
+  }, [runtime, name, key]);
+
+  const [refresh] = useState(() => () => join.current?.refresh());
+  return { status, refresh };
+}
+
+/** Status of the shared stream. `retry` reopens it and catches up without navigating. */
 export function useStatus(): { status: LiveResourceStatus; retry: () => void } {
   const runtime = useRuntime();
   const status = useSyncExternalStore(

@@ -31,7 +31,7 @@ const test = base.extend<Fixtures>({
   },
 });
 
-const status = (page: Page) => page.getByRole("status");
+const status = (page: Page) => page.getByRole("status", { name: "Stream status" });
 const tasks = (page: Page) => page.getByRole("region", { name: "Tasks" });
 const notes = (page: Page) => page.getByRole("region", { name: "Notes" });
 
@@ -77,10 +77,10 @@ test("a write in one tab appears in another without polling or navigation", asyn
   expect(watched.requests).toBe(settled);
 });
 
-test("rolled-back and no-op writes cause no read; another resource stays isolated", async ({
+test("rolled-back and no-op writes cause no read; another topic stays isolated", async ({
   page,
   db,
-  viewer: _viewer,
+  viewer,
   marker,
 }) => {
   await db.query("INSERT INTO tasks (title) VALUES ($1)", [`${marker} existing`]);
@@ -93,7 +93,7 @@ test("rolled-back and no-op writes cause no read; another resource stays isolate
   await db.query("INSERT INTO tasks (title) VALUES ($1)", [`${marker} rolled back`]);
   await db.query("ROLLBACK");
   await db.query("UPDATE tasks SET title = title WHERE title = $1", [`${marker} existing`]);
-  await db.query("INSERT INTO notes (body) VALUES ($1)", [`${marker} note`]);
+  await db.query("INSERT INTO notes (viewer, body) VALUES ($1, $2)", [viewer, `${marker} note`]);
   await expect(notes(page).getByText(`${marker} note`)).toBeVisible();
   expect(taskReads.requests).toBe(0);
 
@@ -103,7 +103,7 @@ test("rolled-back and no-op writes cause no read; another resource stays isolate
   expect(taskReads.requests).toBe(1);
 });
 
-test("revoked access stops updates until access returns and the viewer retries", async ({
+test("a revoked join is denied alone and admitted again on a later heartbeat", async ({
   page,
   db,
   viewer,
@@ -112,28 +112,84 @@ test("revoked access stops updates until access returns and the viewer retries",
   await page.goto("/");
   await expect(status(page)).toHaveText("connected");
   const streams = count(page, "/api/live");
+  const taskReads = count(page, "/api/tasks");
 
   await db.query("UPDATE viewers SET allowed = false WHERE name = $1", [viewer]);
   await db.query("INSERT INTO tasks (title) VALUES ($1)", [`${marker} while revoked`]);
-  await expect(status(page)).toHaveText("unauthorized");
+  await expect(page.getByLabel("Tasks status")).toHaveText("unauthorized", { timeout: 20_000 });
   await expect(tasks(page).getByText(`${marker} while revoked`)).toHaveCount(0);
-
-  // A denial is not retried automatically.
-  await page.waitForTimeout(3_000);
-  expect(streams.requests).toBe(0);
+  // The other join carries on over the same stream.
+  await expect(status(page)).toHaveText("connected");
+  await db.query("INSERT INTO notes (viewer, body) VALUES ($1, $2)", [viewer, `${marker} note`]);
+  await expect(notes(page).getByText(`${marker} note`)).toBeVisible();
+  const deniedReads = taskReads.requests;
 
   await db.query("UPDATE viewers SET allowed = true WHERE name = $1", [viewer]);
-  await page.getByRole("button", { name: "Retry" }).click();
-  await expect(status(page)).toHaveText("connected");
-  await expect(tasks(page).getByText(`${marker} while revoked`)).toBeVisible();
+  await expect(tasks(page).getByText(`${marker} while revoked`)).toBeVisible({ timeout: 20_000 });
+  await expect(page.getByLabel("Tasks status")).toHaveText("connected");
+  // Re-admission needs no new stream and the denied join never read.
+  expect(streams.requests).toBe(0);
+  expect(taskReads.requests).toBe(deniedReads + 1);
   expect(streams.navigations).toBe(0);
 });
 
-test("anonymous viewers cannot subscribe", async ({ page, request }) => {
-  expect((await request.get("/api/live?resource=tasks")).status()).toBe(403);
-  expect((await request.get("/api/live?resource=undeclared")).status()).toBe(400);
+test("a keyed join hears its own key only", async ({ page, db, viewer, marker }) => {
+  await page.goto("/");
+  await expect(status(page)).toHaveText("connected");
+  const noteReads = count(page, "/api/notes");
+
+  await db.query("INSERT INTO notes (viewer, body) VALUES ($1, $2)", [
+    `${viewer}-other`,
+    `${marker} someone else's`,
+  ]);
+  await page.waitForTimeout(1_500);
+  expect(noteReads.requests).toBe(0);
+
+  await db.query("INSERT INTO notes (viewer, body) VALUES ($1, $2)", [viewer, `${marker} mine`]);
+  await expect(notes(page).getByText(`${marker} mine`)).toBeVisible();
+  await expect(notes(page).getByText(`${marker} someone else's`)).toHaveCount(0);
+  expect(noteReads.requests).toBe(1);
+});
+
+test("anonymous viewers cannot join, and a malformed open is refused", async ({
+  page,
+  request,
+}) => {
+  const open = (topics: unknown) => request.post("/api/live", { data: { topics } });
+  expect((await open([{ name: "tasks" }])).status()).toBe(403);
+  // An undeclared name is a denied join, not a broken open; alone it admits nothing.
+  expect((await open([{ name: "undeclared" }])).status()).toBe(403);
+  expect((await open([{ name: "notes", key: "a\nb" }])).status()).toBe(400);
+  expect((await request.get("/api/live?resource=tasks")).status()).toBe(400);
   await page.goto("/");
   await expect(status(page)).toHaveText("unauthorized");
+  await expect(page.getByLabel("Tasks status")).toHaveText("unauthorized");
+});
+
+test("the trigger publishes the key a row leaves and the one it enters, and skips an unchanged row", async ({
+  db,
+  marker,
+}) => {
+  const heard: string[] = [];
+  db.on("notification", ({ payload }) => {
+    if (payload?.includes(marker)) heard.push(payload);
+  });
+  await db.query("LISTEN live_resource");
+  await db.query("INSERT INTO notes (viewer, body) VALUES ($1, 'a')", [`${marker}-1`]);
+  await db.query("UPDATE notes SET viewer = $2 WHERE viewer = $1", [`${marker}-1`, `${marker}-2`]);
+  await db.query("UPDATE notes SET body = 'b' WHERE viewer = $1", [`${marker}-2`]);
+  await db.query("UPDATE notes SET body = 'b' WHERE viewer = $1", [`${marker}-2`]);
+  await db.query("DELETE FROM notes WHERE viewer = $1", [`${marker}-2`]);
+  await expect
+    .poll(() => heard)
+    .toEqual([
+      `notes ${marker}-1`,
+      `notes ${marker}-1`,
+      `notes ${marker}-2`,
+      `notes ${marker}-2`,
+      `notes ${marker}-2`,
+    ]);
+  await db.query("UNLISTEN live_resource");
 });
 
 test("a lost database listener recovers and catches up on what it missed", async ({

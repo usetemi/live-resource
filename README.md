@@ -1,23 +1,21 @@
 # live-resource
 
-Keep a Next.js view current without polling or refreshing, the way Phoenix LiveView does: when a committed Postgres change affects what a page shows, every open tab rereads it.
+Keep a Next.js view current without polling or refreshing, the way Phoenix LiveView does: when a committed Postgres change affects what a page shows, every open tab that joined the topic rereads it.
 
 ```
 browser ── Server Action ──▶ your code ── COMMIT ──▶ Postgres
-                                                        │ trigger: pg_notify('live_resource', 'tasks')
-browser ◀── SSE "invalidate tasks" ◀── live-resource ◀──┘
-browser ── GET /api/tasks ──▶ your authorized Route Handler ──▶ fresh snapshot
+                                                        │ trigger: pg_notify('live_resource', 'tasks 42')
+browser ◀── SSE "invalidate tasks 42" ◀── live-resource ◀──┘
+browser ── GET /api/tasks/42 ──▶ your authorized Route Handler ──▶ fresh data
 ```
 
 - **Client to server is yours.** Writes are ordinary Server Actions. They do not call this library; the committed row fires a trigger.
-- **Server to client is a hint.** The notification carries a resource name and nothing else. No row data crosses the stream.
-- **The browser rereads.** On a hint, the hook fetches a complete JSON snapshot from your own authorized Route Handler and swaps it in only when it has fully arrived and decoded.
+- **Server to client is a hint.** The notification carries a topic and nothing else. No row data crosses the stream.
+- **The browser rereads.** On a hint, the view runs its own read against your authorized server path and applies the result itself.
 
 It assumes Next.js 16, React 19.2, Node.js 22, and Postgres 14, or newer. There are no adapters for other frameworks, runtimes, or databases.
 
 ## Design
-
-This section describes 0.2, which is not released. The sections after it document the installed 0.1.
 
 live-resource is pubsub for server-rendered views, in the shape of Phoenix Channels: a browser joins topics, the server broadcasts that a topic changed, and the view rereads from the server. The server stays the only place data is assembled, and the browser holds nothing but what the view is showing.
 
@@ -27,7 +25,7 @@ live-resource is pubsub for server-rendered views, in the shape of Phoenix Chann
 - A name belongs to **one audience**. When two audiences see different slices of the same rows, a staff inbox and each customer's own page, each is its own name with its own trigger on the shared table and its own key column, rather than one name whose admission depends on who is asking.
 - The key **narrows**. A join without a key hears every hint on its name; a join with a key hears hints for that key and hints without a key. A keyless hint exists for a side table that has no key for the view, so a side table that an audience-scoped name depends on should publish with that audience's key, or every join on the name learns that something changed.
 - A **join** is per topic and answered per topic. `authorize` receives every topic a tab asks for in one call, on open, before a hint is forwarded, and on every heartbeat, and returns the ones it admits. It decides by name and key, never by the caller's role for a shared name. A denied topic fails alone, the rest of the stream continues, and the next heartbeat asks again.
-- A **hint** is the whole payload: topic changed. No row data crosses the stream. The view reads through its own authorized server path, which may be a Route Handler, a server-component refresh, or a delta feed. A read may carry an opaque cursor the server path defines; the library passes it through and never holds a log.
+- A **hint** is the whole payload: topic changed. No row data crosses the stream. The view reads through its own authorized server path, which may be a Route Handler, a server-component refresh, or a delta feed whose cursor the view holds. The library never holds a log.
 - **The browser owns its topic set.** One stream per tab carries the full set, opened by POST and reopened with the full set when it changes. Any server process can serve any open, so a stream never needs to find the process that served the previous one.
 
 **Accepted tradeoffs.**
@@ -47,6 +45,7 @@ live-resource is pubsub for server-rendered views, in the shape of Phoenix Chann
 - *Payloads on the wire.* A broadcast that carries data is data the stream cannot authorize per row.
 - *One name admitting two audiences by role.* `authorize` would have to inspect the session to decide which keys a caller may hear, and the README would have to specify that policy; two names give each audience one policy and one trigger.
 - *Topics encoded in the name (`tasks:42`).* The library has to split name from key anyway; putting the key in the name moves the encoding into every trigger and call site.
+- *A hook that holds the data.* The view already has state and a server-rendered first value; a hook that owned a copy had to compare `initial` across renders and reread on every change to it, which cost two reads per update and a reread per navigation. The view applies its read where it keeps its state.
 
 ## Install
 
@@ -58,21 +57,27 @@ npm install @usetemi/live-resource pg
 
 ### 1. The trigger function
 
-Copy [`sql/live_resource_notify.sql`](sql/live_resource_notify.sql) into a migration in your own migration tool. It is also in the installed package at `node_modules/@usetemi/live-resource/sql/live_resource_notify.sql`. Then attach it to every table a resource's snapshot reads from, naming the resource:
+Copy [`sql/live_resource_notify.sql`](sql/live_resource_notify.sql) into a migration in your own migration tool. It is also in the installed package at `node_modules/@usetemi/live-resource/sql/live_resource_notify.sql`. Then attach it to every table a topic's read depends on, naming the topic and the column that holds its key:
 
 ```sql
 CREATE TRIGGER live_resource_tasks
 AFTER INSERT OR UPDATE OR DELETE ON tasks
-FOR EACH ROW EXECUTE FUNCTION live_resource_notify('tasks');
+FOR EACH ROW EXECUTE FUNCTION live_resource_notify('tasks', 'id');
+
+CREATE TRIGGER live_resource_tasks_comments
+AFTER INSERT OR UPDATE OR DELETE ON comments
+FOR EACH ROW EXECUTE FUNCTION live_resource_notify('tasks', 'task_id');
 ```
 
-A resource names a projection, not a table. If the `tasks` view joins `users`, put a `live_resource_notify('tasks')` trigger on `users` too. The library does not infer dependencies. Resource names match `^[a-z][a-z0-9_]{0,63}$`.
+A topic names a projection, not a table. If the `tasks` view joins `users`, put a `live_resource_notify('tasks')` trigger on `users` too; without a key column it publishes a keyless hint, which every join on `tasks` hears. The library does not infer dependencies. Names match `^[a-z][a-z0-9_]{0,63}$`.
 
-Postgres delivers the notification only after commit and drops it on rollback. Identical notifications within one transaction are coalesced, and the function skips updates that change nothing.
+The key is the column's value as `to_jsonb` renders it, compared as text: a uuid is lowercase, a number has no quotes. An `INSERT` publishes the new row's key, a `DELETE` the old row's, and an `UPDATE` that moves a row between keys publishes both. A row whose key column is null publishes nothing, and so does a trigger naming a column the table lacks; the server reports the latter when it connects. A key the stream cannot carry, empty, longer than 256 characters, or holding a control character, arrives as a keyless hint instead.
+
+Postgres delivers the notification only after commit and drops it on rollback. Identical notifications within one transaction are coalesced, and the function skips updates that change nothing. The trigger must be `AFTER`, and `FOR EACH ROW` when it names a key column; the function raises otherwise. Row triggers do not fire on `TRUNCATE`; where a view must hear one, add a keyless `AFTER TRUNCATE ... FOR EACH STATEMENT` trigger.
 
 ### 2. The stream endpoint
 
-Create the server once per process and route `GET` to it.
+Create the server once per process and route `POST` to it.
 
 ```ts
 // src/live.ts
@@ -84,9 +89,12 @@ declare global {
 
 export const live = (globalThis.__live ??= createLiveResourceServer({
   connectionString: process.env.DIRECT_DATABASE_URL!,
-  resources: ["tasks", "notes"],
-  authorize: async (request, resources) => (await currentUser(request))?.canRead(resources) === true,
-  log: (event) => console[event.level](`live-resource: ${event.name}`),
+  topics: ["tasks", "notes"],
+  authorize: async (request, topics) => {
+    const user = await currentUser(request);
+    return user ? topics.filter((topic) => user.canRead(topic)) : [];
+  },
+  log: (event) => console[event.level](`live-resource: ${event.name}`, event.detail ?? ""),
 }));
 ```
 
@@ -94,22 +102,23 @@ export const live = (globalThis.__live ??= createLiveResourceServer({
 // src/app/api/live/route.ts
 import { live } from "@/live";
 
-export const GET = (request: Request) => live.handle(request);
+export const POST = (request: Request) => live.handle(request);
 ```
 
 - `connectionString` must be a direct connection. `LISTEN` does not survive transaction pooling. Your ordinary queries can keep using a pooled one.
-- `authorize` runs when a stream opens, before invalidations are forwarded, and on every heartbeat. Read current access from your session store or database rather than trusting a cached session: this callback is what ends a stream after access is revoked. It receives every requested resource in one call.
+- `topics` is every name a browser may join. Each time the listener connects, the server compares the list with the installed `live_resource_notify` triggers and logs a `trigger_mismatch` warning for each disagreement. It keeps serving.
+- `authorize` runs when a stream opens, before a hint is forwarded, and on every heartbeat, with every topic the stream asked for, and returns the ones it admits. Decide by name and key: a customer may join `orders` with their own id as the key and nothing else. Read current access from your session store or database rather than trusting a cached session: this callback is what ends a join after access is revoked.
 - `log` is optional. Without it nothing is logged.
 - Call `live.close()` during shutdown. It ends the listener and every open stream, and `handle` answers 503 afterwards.
 
-### 3. The snapshot endpoint
+### 3. The read
 
-One Route Handler per resource, authorized on its own. The stream's authorization does not protect it.
+One authorized server path per view, authorized on its own. The stream's authorization does not protect it.
 
 ```ts
 // src/app/api/tasks/route.ts
 export async function GET(request: Request) {
-  if (!(await currentUser(request))?.canRead(["tasks"])) {
+  if (!(await currentUser(request))?.canRead({ name: "tasks" })) {
     return new Response("Not authorized", { status: 403 });
   }
   return Response.json(await readTasks(), { headers: { "Cache-Control": "private, no-store" } });
@@ -118,19 +127,21 @@ export async function GET(request: Request) {
 
 ### 4. The view
 
-Mount the provider once above every live view, render the first snapshot on the server, and hand it to the hook.
+Mount the provider once above every live view, render the first value on the server, hand it to the view as its initial state, and join the topic with a read that applies the result.
 
 ```tsx
 "use client";
 
-import { LiveResourceProvider, useSnapshot, useStatus } from "@usetemi/live-resource";
+import { LiveResourceProvider, readFrom, useStatus, useTopic } from "@usetemi/live-resource";
+import { useState } from "react";
 
 export function Live({ children }: { children: React.ReactNode }) {
   return <LiveResourceProvider endpoint="/api/live">{children}</LiveResourceProvider>;
 }
 
 export function Tasks({ initial }: { initial: Task[] }) {
-  const tasks = useSnapshot("tasks", { initial, url: "/api/tasks" });
+  const [tasks, setTasks] = useState(initial);
+  useTopic("tasks", readFrom("/api/tasks", async (response) => setTasks(await response.json())));
   return (
     <ul>
       {tasks.map((task) => (
@@ -138,6 +149,15 @@ export function Tasks({ initial }: { initial: Task[] }) {
       ))}
     </ul>
   );
+}
+
+export function Task({ id, initial }: { id: number; initial: Task }) {
+  const [task, setTask] = useState(initial);
+  useTopic(
+    { name: "tasks", key: String(id) },
+    readFrom(`/api/tasks/${id}`, async (response) => setTask(await response.json()))
+  );
+  return <h1>{task.title}</h1>;
 }
 
 export function Status() {
@@ -158,20 +178,26 @@ export default async function Page() {
 }
 ```
 
-Give rows stable keys. The hook replaces data, not components, so filters, open menus, focus, and scroll position survive an update.
+Give rows stable keys. The view replaces data, not components, so filters, open menus, focus, and scroll position survive an update.
 
 A complete application is in [`example/`](example).
 
 ## API
 
-### `useSnapshot(resource, { initial, url, decode? })`
+### `useTopic(topic, read)`
 
-Returns the current snapshot, starting from `initial`.
+Joins `topic`, a name or `{ name, key }`, and runs `read` when it changes. Returns `{ status, refresh }` for that join.
 
-- `url` is fetched with `cache: "no-store"`. Put the view's selection in its query string, such as `/api/tasks?state=open`.
-- `decode` turns the parsed JSON into your type, for example to revive dates or validate with a schema. Throwing rejects the snapshot. Without it the JSON is cast.
-- A new `initial`, from a navigation or a changed selection, renders immediately and schedules a catch-up read, because the server may have read it before a hint this tab already consumed. A changed `url` does the same.
-- The data on screen changes only when a complete snapshot has arrived and decoded. A failed, slow, or canceled read keeps the current data and never navigates.
+- `read(signal)` is called once after the stream is ready, on every hint for the topic, and after every reconnection. It applies its result and resolves; it rejects on failure and honors `signal` before applying. The latest `read` passed to the hook is the one called, so it may close over current props and state.
+- Reads for one join never overlap. A hint during a read marks the join dirty, and exactly one more read follows.
+- `refresh()` asks for one more read, coalesced the same way. Call it when the read's inputs change, such as a filter the user chose or a cursor the view advanced.
+- `status` is `connected` once the join has caught up, `reconnecting` while the stream or a read is interrupted, and `unauthorized` while `authorize` refuses the topic or the open itself was refused. While the stream is open, a refused join is asked again on every heartbeat and reads once admitted; a refused open stays refused until `retry`.
+- `topic` is checked when the hook renders: a name outside `^[a-z][a-z0-9_]{0,63}$`, or a key that is empty, over 256 characters, or holds a control character, throws.
+- The view owns its state. The server-rendered value is the initial state and nothing more; the first read after `ready` replaces it. A changed selection is the view's to handle: change what `read` fetches and call `refresh()`, or remount the view with a `key`.
+
+### `readFrom(url, receive)`
+
+A read for the common case: fetches `url` with `cache: "no-store"` and the join's signal, rejects a response that is not `ok`, and otherwise hands the `Response` to `receive`, which applies it. Put the view's selection in the query string, such as `/api/tasks?state=open`.
 
 ### `useStatus()`
 
@@ -179,40 +205,53 @@ Returns `{ status, retry }` for the tab's shared stream.
 
 | Status | Meaning |
 | --- | --- |
-| `idle` | Nothing is subscribed. |
-| `connected` | Every subscribed snapshot has caught up. |
-| `reconnecting` | The stream, the database listener, or a read was interrupted. It clears only after every snapshot catches up. |
-| `unauthorized` | Access was denied. Automatic retries have stopped. |
+| `idle` | Nothing is joined. |
+| `connected` | Every admitted join has caught up. |
+| `reconnecting` | The stream, the database listener, or a read was interrupted. It clears only after every admitted join catches up. |
+| `unauthorized` | The open was refused, or every join is denied. Automatic retries of a refused open have stopped; a 400, which is a configuration error, is reported the same way with the reason in the console. |
 
-`retry` resubscribes and catches up without navigating, so unsaved page state survives. Offer it with a way to sign in again.
+`retry` reopens the stream and catches up without navigating, so unsaved page state survives. Offer it with a way to sign in again.
 
-### `createLiveResourceServer({ connectionString, resources, authorize, log? })`
+### `createLiveResourceServer({ connectionString, topics, authorize, log? })`
 
-Returns `{ handle(request): Promise<Response>, close(): Promise<void> }`. `handle` answers 400 for an undeclared or missing `resource` parameter, 403 when `authorize` answers false, 503 after `close`, and otherwise the event stream.
+Returns `{ handle(request): Promise<Response>, close(): Promise<void> }`. `handle` takes a `POST` whose JSON body is `{ topics: [{ name, key? }] }` and answers 400 for any other method, a malformed topic, or more than 256 topics; 403 when `authorize` admits none of them; 503 after `close` or when `authorize` throws; and otherwise the event stream, with a `denied` frame for each topic `authorize` refused. A name the server does not declare is never offered to `authorize` and is denied like any other, so one view's typo does not take down the tab's other joins; the connect-time trigger check is what reports the typo.
+
+`authorize` receives the same `Request` on every call, the one that opened the stream, with its body consumed: decide from its headers and from current state.
+
+Upgrading from 0.1:
+
+- `resources` is `topics`, and `authorize` returns the admitted topics instead of a boolean. A callback that still returns `true` fails every open.
+- Re-apply `sql/live_resource_notify.sql`; it replaces the function in place. Existing one-argument triggers keep working and publish keyless hints.
+- `useSnapshot` is gone. The view keeps its own state and joins with `useTopic`; a new server-rendered value is not applied to a mounted view, so remount with a `key` or call `refresh()` where the selection changes.
+- The 0.1 browser opens with `GET`. Route `GET` to `handle` as well until no such tab is left; the 400 it answers stops that client's retries.
 
 ## How it behaves
 
-**One stream per tab, one listener per process.** Every `useSnapshot` in a tab shares one SSE connection, and every stream in a server process shares one dedicated Postgres connection. The first subscription to a resource name the stream does not carry reconnects it with the full set. Subscribing again to a carried name only reads.
+**One stream per tab, one listener per process.** Every `useTopic` in a tab shares one SSE connection, and every stream in a server process shares one dedicated Postgres connection. The first join to a topic the stream does not carry reopens it with the full set. Joining a carried topic again only reads.
 
-**Subscribe, then read.** The server sends `ready` only after `LISTEN` has committed, and the browser reads only after `ready`. A change that lands between the server render and the subscription is therefore picked up by the first read rather than lost. The same holds after every reconnection.
+**Join, then read.** The server sends `ready` only after `LISTEN` has committed, and the browser reads only after `ready`. A change that lands between the server render and the join is therefore picked up by the first read rather than lost. The same holds after every reconnection.
 
-**Reads are serialized per subscription.** A hint that arrives during a read marks the subscription dirty, and exactly one more read follows. A read is aborted after 30 seconds, and its lock is held until it settles, so a late completion cannot overlap its retry. A failed read resubscribes before reading again.
+**Denied joins never read.** A refused topic is announced before `ready` and before any hint, so the browser does not catch up on a join whose own read would be refused. Every heartbeat asks `authorize` again and announces what changed; a join admitted later reads once, and a join denied later stops.
+
+**Hints are forwarded per join.** A notification marks the admitted joins it reaches, and the stream sends one `invalidate` per marked join, so a bulk update that publishes thousands of keys costs a keyless join one frame.
+
+**Reads are serialized per join.** A hint that arrives during a read marks the join dirty, and exactly one more read follows. A read is aborted after 30 seconds, and its lock is held until it settles, so a late completion cannot overlap its retry. A failed read reopens the stream before reading again, with a backoff that resets only when a read lands, so one route that keeps failing is retried slower and slower rather than twice a second.
 
 **Recovery is split.** The server owns the database listener: it probes the connection, reconnects with backoff, and keeps browser streams open while it does, telling them `interrupted` and then `ready`. The browser owns the stream: it reconnects with backoff and treats 45 seconds of silence as a dead connection.
 
-**Hidden tabs.** A hidden tab with a healthy stream keeps receiving hints and rereading, so it is current the moment you switch back. A hidden tab whose stream breaks does not retry until it is visible again, and then attempts immediately with no accumulated backoff. A healthy return causes no extra subscription or read. The aim is visual stability and a fast return. The costs are background bandwidth for hidden tabs and no freshness promise after an outage or a browser suspension.
+**Hidden tabs.** A hidden tab with a healthy stream keeps receiving hints and rereading, so it is current the moment you switch back. A hidden tab whose stream breaks does not retry until it is visible again, and then attempts immediately with no accumulated backoff. A healthy return causes no extra open or read. The aim is visual stability and a fast return. The costs are background bandwidth for hidden tabs and no freshness promise after an outage or a browser suspension.
 
-**Bounds.** A stream that stops draining is closed at 64 queued frames. The browser rejects a frame buffer over 16 KiB. A stream may request at most 32 resources.
+**Bounds.** A stream that stops draining is closed at 64 queued batches, where one heartbeat's frames are one batch. The browser rejects an unterminated frame over 16 KiB. An open may carry at most 256 topics. Joins made in the same tick open one stream between them. The trigger costs a bulk write a few microseconds per row on Postgres 16 and scales linearly with the number of distinct keys; a wide row pays more for the unchanged-row comparison than for the key.
 
-These values are fixed. The protocol, including the `live_resource` channel, is the contract between the two halves of the package and is not configurable.
+These values are fixed. The protocol, including the `live_resource` channel and the `name key` form of a topic on it, is the contract between the two halves of the package and is not configurable.
 
 ## What it is not
 
 - **Not a durable log.** Notifications are hints to reread. A missed hint is repaired by the next `ready`, not replayed.
 - **Not exactly-once.** A burst of changes may produce one read or several.
 - **Not a job queue.** Do not run commands or background work from a hint.
-- **Not a diff protocol.** Every update is a full snapshot read. Keep snapshot queries cheap and bounded.
-- **Not a write path.** Use Server Actions. Snapshot reads deliberately do not use them: Next.js dispatches Server Actions one at a time per client, so a background reread would queue ahead of the user's next mutation; action IDs change between deployments, which breaks a tab that stays open across a deploy; and an action cannot be aborted. A Route Handler URL is stable, parallel, and cancelable.
+- **Not a diff protocol.** The library carries no data. A read may fetch a snapshot or a delta from a cursor the view holds; either way the view applies it.
+- **Not a write path.** Use Server Actions. Reads deliberately do not use them: Next.js dispatches Server Actions one at a time per client, so a background reread would queue ahead of the user's next mutation; action IDs change between deployments, which breaks a tab that stays open across a deploy; and an action cannot be aborted. A Route Handler URL is stable, parallel, and cancelable.
 
 ## Development
 
