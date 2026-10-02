@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1
+
+The runtime and the protocol are unchanged.
+
+- `usage-rules.md` ships in the package: the rules for code that uses the library, as directives for a coding agent.
+- `npx live-resource agent-rules <file>...` writes a marked block pointing at that file into each agent file it is given, replacing an existing block and leaving the rest alone. `--check` exits 1 when a block is missing or out of date.
+- The README states what was only implied: a read must not write a table that publishes its own topic; an update that only bumps a timestamp still publishes; `authorize` runs per stream on open, per hint, and every 15 seconds; a hint announces a row write and nothing else; a route with a live view must show `unauthorized`; a hint runs the read without delay; a browser test waits for the join before it writes.
+
 ## 0.2.0
 
 - Topics: a name and an optional key. `live_resource_notify(name, keyColumn?)` publishes the row's key, both keys when an update moves a row, and nothing for a null key. A keyed join hears its key and keyless hints; an unkeyed join hears every hint on the name.

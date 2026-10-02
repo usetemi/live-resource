@@ -1,6 +1,6 @@
 {
   "name": "@usetemi/live-resource",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Keep Next.js views current from Postgres notifications over SSE, with authorized rereads.",
   "keywords": [
     "listen",
@@ -26,9 +26,13 @@
     "sql",
     "LICENSE",
     "README.md",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "usage-rules.md"
   ],
   "type": "module",
+  "bin": {
+    "live-resource": "./dist/bin.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
