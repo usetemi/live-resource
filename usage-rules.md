@@ -46,7 +46,7 @@ Rules for code that uses `@usetemi/live-resource`. They hold for the installed v
 
 ## Browser tests
 
-- A row written before the join is ready reaches the view through the first read, not through a hint. A test that means to prove a hint must wait for the join first: wait for the stream endpoint's response or for the `connected` status, then write the row.
+- A row written before the join is ready reaches the view through the first read, not through a hint. A test that means to prove a hint must wait for the join first: wait until the page shows the `connected` status, then write the row. The stream endpoint's response is not enough; it arrives before the server is listening.
 - Assert what the user sees after the write. Do not assert the number of reads; a burst may produce one or several.
 
 ## Keeping this file in an agent's context
@@ -55,4 +55,4 @@ Rules for code that uses `@usetemi/live-resource`. They hold for the installed v
 npx live-resource agent-rules AGENTS.md
 ```
 
-The command writes a short marked block that points at this file into each path it is given, and changes nothing outside the markers. Run it again after moving the block or upgrading; `--check` exits non-zero when a file's block is missing or out of date, without writing.
+The command writes a short marked block that points at this file into each path it is given, and changes nothing outside the markers. `--check` writes nothing and exits 1 when a file's block is missing or out of date; run the command again when it does.

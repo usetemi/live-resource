@@ -235,13 +235,13 @@ The package ships [`usage-rules.md`](usage-rules.md): the rules above as short d
 npx live-resource agent-rules AGENTS.md src/live/AGENTS.md
 ```
 
-The command writes a marked block that points at the file into each path it is given. It replaces an existing block where it stands, appends one to a file that has none, creates a file that does not exist, and changes nothing outside the markers. It runs only when you run it. `--check` writes nothing and exits 1 when a file's block is missing or out of date, which suits CI.
+The command writes a marked block that points at the file into each path it is given. It replaces an existing block where it stands, appends one to a file that has none, creates a file that does not exist, and changes nothing outside the markers. It runs only when you run it. `--check` writes nothing and exits 1 when a file's block is missing or out of date, which suits CI. Any other failure, such as a file holding one marker without the other or a path that cannot be read, exits 2 and writes nothing.
 
 ## How it behaves
 
 **One stream per tab, one listener per process.** Every `useTopic` in a tab shares one SSE connection, and every stream in a server process shares one dedicated Postgres connection. The first join to a topic the stream does not carry reopens it with the full set. Joining a carried topic again only reads.
 
-**Join, then read.** The server sends `ready` only after `LISTEN` has committed, and the browser reads only after `ready`. A change that lands between the server render and the join is therefore picked up by the first read rather than lost. The same holds after every reconnection. In a browser test, a row written before the join is ready reaches the view through that first read, not through a hint; a test that means to prove a hint waits for the stream endpoint's response or the `connected` status before it writes.
+**Join, then read.** The server sends `ready` only after `LISTEN` has committed, and the browser reads only after `ready`. A change that lands between the server render and the join is therefore picked up by the first read rather than lost. The same holds after every reconnection. In a browser test, a row written before the join is ready reaches the view through that first read, not through a hint; a test that means to prove a hint waits for the `connected` status before it writes. The stream endpoint's response arrives before the server is listening, so it is not that signal.
 
 **Denied joins never read.** A refused topic is announced before `ready` and before any hint, so the browser does not catch up on a join whose own read would be refused. Every heartbeat asks `authorize` again and announces what changed; a join admitted later reads once, and a join denied later stops.
 

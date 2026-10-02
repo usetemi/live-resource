@@ -58,8 +58,11 @@ test("a CRLF file keeps its line endings", () => {
   const file = join(dir, "AGENTS.md");
   writeFileSync(file, "# Project\r\n");
 
-  run(dir, "AGENTS.md");
-  expect(readFileSync(file, "utf8").replaceAll("\r\n", "")).not.toContain("\n");
+  expect(run(dir, "AGENTS.md").status).toBe(0);
+  const text = readFileSync(file, "utf8");
+  expect(text.startsWith("# Project\r\n\r\n" + BEGIN + "\r\n")).toBe(true);
+  expect(text.endsWith(END + "\r\n")).toBe(true);
+  expect(text).not.toMatch(/(?<!\r)\n/);
 });
 
 test("a missing file is created holding only the block", () => {
@@ -102,6 +105,16 @@ test("a marker without its pair is refused and no file in the call is written", 
   expect(refused.output).toContain("broken.md");
   expect(readFileSync(join(dir, "broken.md"), "utf8")).toBe(broken);
   expect(readFileSync(join(dir, "first.md"), "utf8")).toBe("# First\n");
+});
+
+test("a path that cannot be read is an error, not a stale block", () => {
+  const dir = mkdtempSync(join(tmpdir(), "agent-rules-"));
+  writeFileSync(join(dir, "first.md"), "# First\n");
+
+  const refused = run(dir, "--check", "first.md", ".");
+  expect(refused.status).toBe(2);
+  expect(refused.output).toContain(".: ");
+  expect(refused.output).not.toContain("    at ");
 });
 
 test("a call without a file to write is refused with the usage text", () => {
