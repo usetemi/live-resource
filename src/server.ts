@@ -37,9 +37,10 @@ export type LiveResourceServerOptions = {
   topics: readonly string[];
   /**
    * Called when a stream opens, before a hint is forwarded, and on every heartbeat,
-   * with every topic the stream asked for; returns the ones it admits. Decide by
-   * name and key, and read current access rather than a cached session: this is
-   * what ends a join after access is revoked.
+   * with every declared topic the stream asked for; returns the ones it admits.
+   * Every call receives the same Request, the one that opened the stream, with its
+   * body consumed, so decide from its headers and from current access rather than
+   * a cached session: this is what ends a join after access is revoked.
    */
   authorize: (
     request: Request,
@@ -53,8 +54,8 @@ type ListenerEvent =
   | { type: "hint"; topic: LiveResourceTopic };
 
 /**
- * Compare the declared names with the triggers that publish on the channel. A
- * declared name nothing publishes, a trigger naming an undeclared topic, or a key
+ * Compare the declared names with the enabled triggers that publish on the channel.
+ * A declared name nothing publishes, a trigger naming an undeclared topic, or a key
  * column the table lacks is a stale view waiting to happen, so each is logged.
  */
 async function checkTriggers(
@@ -64,22 +65,28 @@ async function checkTriggers(
 ) {
   const warn = (detail: string) => log({ level: "warn", name: "trigger_mismatch", detail });
   try {
+    // attname is `name`, which pg hands back unparsed as an array; text parses.
     const { rows } = await connection.query<{ table: string; tgargs: Buffer; columns: string[] }>(
       `SELECT t.tgrelid::regclass::text AS "table", t.tgargs,
-              array(SELECT a.attname FROM pg_attribute a
+              array(SELECT a.attname::text FROM pg_attribute a
                     WHERE a.attrelid = t.tgrelid AND a.attnum > 0 AND NOT a.attisdropped) AS columns
        FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid
-       WHERE p.proname = 'live_resource_notify' AND NOT t.tgisinternal`
+       WHERE p.proname = 'live_resource_notify' AND NOT t.tgisinternal AND t.tgenabled <> 'D'`
     );
     const published = new Set<string>();
     for (const { table, tgargs, columns } of rows) {
       // tgargs is every argument NUL-terminated: "name\0" or "name\0key\0".
-      const [name, key] = tgargs.toString("utf8").split("\0");
-      if (name === undefined || name === "") continue;
+      const args = tgargs.toString("utf8").split("\0");
+      args.pop();
+      const [name = "", key] = args;
+      if (!TOPIC_NAME.test(name)) {
+        warn(`${table}: trigger publishes an invalid topic name ${JSON.stringify(name)}`);
+        continue;
+      }
       published.add(name);
       if (!declared.has(name)) warn(`${table}: trigger publishes undeclared topic ${name}`);
-      if (key !== undefined && key !== "" && !columns.includes(key)) {
-        warn(`${table}: trigger for ${name} names missing key column ${key}`);
+      if (key !== undefined && !columns.includes(key)) {
+        warn(`${table}: trigger for ${name} names missing key column ${JSON.stringify(key)}`);
       }
     }
     for (const name of declared) {
@@ -180,18 +187,15 @@ function createListener(
   };
 }
 
-/** The distinct, declared topics of an open request body, or undefined when the body is not one. */
-function parseTopics(
-  body: unknown,
-  declared: ReadonlySet<string>
-): LiveResourceTopic[] | undefined {
+/** The distinct topics of an open request body, or undefined when the body is not one. */
+function parseTopics(body: unknown): LiveResourceTopic[] | undefined {
   if (typeof body !== "object" || body === null) return undefined;
   const { topics } = body as Record<string, unknown>;
   if (!Array.isArray(topics) || topics.length === 0 || topics.length > MAX_TOPICS) return undefined;
   const distinct = new Map<string, LiveResourceTopic>();
   for (const topic of topics) {
-    if (!isTopic(topic) || !declared.has(topic.name)) return undefined;
-    distinct.set(encodeTopic(topic), topic);
+    if (!isTopic(topic)) return undefined;
+    distinct.set(encodeTopic(topic), { name: topic.name, key: topic.key });
   }
   return [...distinct.values()];
 }
@@ -219,11 +223,16 @@ export function createLiveResourceServer(options: LiveResourceServerOptions) {
   const listener = createListener(options.connectionString, declared, log);
   let closing: Promise<void> | undefined;
 
-  /** The requested topics `authorize` admits, by encoding. Anything it returns that was not asked for is ignored. */
+  /**
+   * The requested topics `authorize` admits, by encoding. An undeclared name is
+   * never offered to it, and anything it returns that was not asked for is ignored.
+   */
   async function admit(request: Request, requested: readonly LiveResourceTopic[]) {
-    const asked = new Set(requested.map(encodeTopic));
+    const offered = requested.filter((topic) => declared.has(topic.name));
+    const asked = new Set(offered.map(encodeTopic));
     const admitted = new Set<string>();
-    for (const topic of await options.authorize(request, requested)) {
+    if (offered.length === 0) return admitted;
+    for (const topic of await options.authorize(request, offered)) {
       const encoded = encodeTopic(topic);
       if (asked.has(encoded)) admitted.add(encoded);
     }
@@ -234,10 +243,16 @@ export function createLiveResourceServer(options: LiveResourceServerOptions) {
     if (closing) return new Response("Shutting down", { status: 503 });
     // Also answers a GET from a tab still running an earlier client, which stops on 400.
     if (request.method !== "POST") return new Response("Open with POST", { status: 400 });
-    const parsed = parseTopics(await request.json().catch(() => undefined), declared);
+    const parsed = parseTopics(await request.json().catch(() => undefined));
     if (!parsed) return new Response("Invalid topics", { status: 400 });
     const requested: readonly LiveResourceTopic[] = parsed;
-    const admitted = await admit(request, requested);
+    let admitted: Set<string>;
+    try {
+      admitted = await admit(request, requested);
+    } catch {
+      log({ level: "warn", name: "authorization_failed" });
+      return new Response("Authorization unavailable", { status: 503 });
+    }
     if (admitted.size === 0) return new Response("Not authorized", { status: 403 });
     if (closing) return new Response("Shutting down", { status: 503 });
     const joins = requested.map((topic): Join => {
@@ -265,14 +280,16 @@ export function createLiveResourceServer(options: LiveResourceServerOptions) {
             request.signal.removeEventListener("abort", cleanup);
             if (!canceled) controller.close();
           };
-          function send(type: string, data: string = "") {
-            if (closed) return;
+          const frame = (type: string, data: string = "") => `event: ${type}\ndata: ${data}\n\n`;
+          // One enqueue per batch, so a flush with many joins counts once against the bound.
+          function write(frames: string[]) {
+            if (closed || frames.length === 0) return;
             if ((controller.desiredSize ?? 0) <= 0) {
               log({ level: "warn", name: "slow_consumer" });
               cleanup();
               return;
             }
-            controller.enqueue(encoder.encode(`event: ${type}\ndata: ${data}\n\n`));
+            controller.enqueue(encoder.encode(frames.join("")));
           }
           // Admission changes go out before `ready` and before hints, so the browser
           // never catches up on a join whose own read would be refused.
@@ -282,27 +299,29 @@ export function createLiveResourceServer(options: LiveResourceServerOptions) {
             try {
               const current = await admit(request, requested);
               if (closed) return;
+              const frames: string[] = [];
               for (const join of joins) {
                 join.admitted = current.has(join.encoded);
                 if (!join.admitted) join.dirty = false;
                 if (join.told === undefined ? !join.admitted : join.told !== join.admitted) {
-                  send(join.admitted ? "admitted" : "denied", join.encoded);
+                  frames.push(frame(join.admitted ? "admitted" : "denied", join.encoded));
                 }
                 join.told = join.admitted;
               }
               if (ready) {
                 if (needsReady) {
                   needsReady = false;
-                  send("ready");
+                  frames.push(frame("ready"));
                 }
                 for (const join of joins) {
-                  if (join.dirty) send("invalidate", join.encoded);
+                  if (join.dirty) frames.push(frame("invalidate", join.encoded));
                   join.dirty = false;
                 }
               }
-              send("heartbeat");
+              frames.push(frame("heartbeat"));
+              write(frames);
             } catch {
-              log({ level: "warn", name: "authorization_failed" });
+              if (!closed) log({ level: "warn", name: "authorization_failed" });
               cleanup();
             } finally {
               checking = false;
@@ -318,7 +337,7 @@ export function createLiveResourceServer(options: LiveResourceServerOptions) {
               ready = false;
               needsReady = false;
               for (const join of joins) join.dirty = false;
-              send("interrupted");
+              write([frame("interrupted")]);
               return;
             }
             if (event.type === "ready") {

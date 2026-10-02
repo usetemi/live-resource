@@ -3,7 +3,8 @@
 ## 0.2.0
 
 - Topics: a name and an optional key. `live_resource_notify(name, keyColumn?)` publishes the row's key, both keys when an update moves a row, and nothing for a null key. A keyed join hears its key and keyless hints; an unkeyed join hears every hint on the name.
-- `authorize(request, topics)` returns the admitted topics. A denied join fails alone, is announced before `ready`, and is asked again on every heartbeat; an open that admits nothing is still 403.
+- `authorize(request, topics)` returns the admitted topics. A denied join fails alone, is announced before `ready`, and is asked again on every heartbeat; an open that admits nothing is still 403. An undeclared name is denied rather than failing the open.
+- A failed read's reconnect backoff resets when a read lands, not when the stream opens.
 - The stream opens with `POST` and a JSON body of topics. A `GET` is answered 400, which stops a 0.1 browser's retries.
 - `topics` replaces `resources`. On every listener connect the declared names are compared with the installed triggers and each mismatch is logged as `trigger_mismatch`.
 - `useTopic(topic, read)` replaces `useSnapshot`. The view owns its state and applies each read itself; `readFrom(url, receive)` covers the fetch-and-apply case. `useStatus` is unchanged, and reports `unauthorized` when every join is denied.

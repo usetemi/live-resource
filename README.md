@@ -73,7 +73,7 @@ A topic names a projection, not a table. If the `tasks` view joins `users`, put 
 
 The key is the column's value as `to_jsonb` renders it, compared as text: a uuid is lowercase, a number has no quotes. An `INSERT` publishes the new row's key, a `DELETE` the old row's, and an `UPDATE` that moves a row between keys publishes both. A row whose key column is null publishes nothing, and so does a trigger naming a column the table lacks; the server reports the latter when it connects. A key the stream cannot carry, empty, longer than 256 characters, or holding a control character, arrives as a keyless hint instead.
 
-Postgres delivers the notification only after commit and drops it on rollback. Identical notifications within one transaction are coalesced, and the function skips updates that change nothing.
+Postgres delivers the notification only after commit and drops it on rollback. Identical notifications within one transaction are coalesced, and the function skips updates that change nothing. The trigger must be `AFTER`, and `FOR EACH ROW` when it names a key column; the function raises otherwise. Row triggers do not fire on `TRUNCATE`; where a view must hear one, add a keyless `AFTER TRUNCATE ... FOR EACH STATEMENT` trigger.
 
 ### 2. The stream endpoint
 
@@ -191,7 +191,8 @@ Joins `topic`, a name or `{ name, key }`, and runs `read` when it changes. Retur
 - `read(signal)` is called once after the stream is ready, on every hint for the topic, and after every reconnection. It applies its result and resolves; it rejects on failure and honors `signal` before applying. The latest `read` passed to the hook is the one called, so it may close over current props and state.
 - Reads for one join never overlap. A hint during a read marks the join dirty, and exactly one more read follows.
 - `refresh()` asks for one more read, coalesced the same way. Call it when the read's inputs change, such as a filter the user chose or a cursor the view advanced.
-- `status` is `connected` once the join has caught up, `reconnecting` while the stream or a read is interrupted, and `unauthorized` while `authorize` refuses the topic. A refused join is asked again on every heartbeat and reads once admitted.
+- `status` is `connected` once the join has caught up, `reconnecting` while the stream or a read is interrupted, and `unauthorized` while `authorize` refuses the topic or the open itself was refused. While the stream is open, a refused join is asked again on every heartbeat and reads once admitted; a refused open stays refused until `retry`.
+- `topic` is checked when the hook renders: a name outside `^[a-z][a-z0-9_]{0,63}$`, or a key that is empty, over 256 characters, or holds a control character, throws.
 - The view owns its state. The server-rendered value is the initial state and nothing more; the first read after `ready` replaces it. A changed selection is the view's to handle: change what `read` fetches and call `refresh()`, or remount the view with a `key`.
 
 ### `readFrom(url, receive)`
@@ -207,15 +208,22 @@ Returns `{ status, retry }` for the tab's shared stream.
 | `idle` | Nothing is joined. |
 | `connected` | Every admitted join has caught up. |
 | `reconnecting` | The stream, the database listener, or a read was interrupted. It clears only after every admitted join catches up. |
-| `unauthorized` | The open was refused, or every join is denied. Automatic retries of a refused open have stopped. |
+| `unauthorized` | The open was refused, or every join is denied. Automatic retries of a refused open have stopped; a 400, which is a configuration error, is reported the same way with the reason in the console. |
 
 `retry` reopens the stream and catches up without navigating, so unsaved page state survives. Offer it with a way to sign in again.
 
 ### `createLiveResourceServer({ connectionString, topics, authorize, log? })`
 
-Returns `{ handle(request): Promise<Response>, close(): Promise<void> }`. `handle` takes a `POST` whose JSON body is `{ topics: [{ name, key? }] }` and answers 400 for any other method, an undeclared name, a key that is empty, longer than 256 characters, or contains a control character, or more than 256 topics; 403 when `authorize` admits none of them; 503 after `close`; and otherwise the event stream, with a `denied` frame for each topic `authorize` refused.
+Returns `{ handle(request): Promise<Response>, close(): Promise<void> }`. `handle` takes a `POST` whose JSON body is `{ topics: [{ name, key? }] }` and answers 400 for any other method, a malformed topic, or more than 256 topics; 403 when `authorize` admits none of them; 503 after `close` or when `authorize` throws; and otherwise the event stream, with a `denied` frame for each topic `authorize` refused. A name the server does not declare is never offered to `authorize` and is denied like any other, so one view's typo does not take down the tab's other joins; the connect-time trigger check is what reports the typo.
 
-Upgrading from 0.1: the 0.1 browser opens with `GET`. Route `GET` to `handle` as well until no such tab is left; the 400 it answers stops that client's retries.
+`authorize` receives the same `Request` on every call, the one that opened the stream, with its body consumed: decide from its headers and from current state.
+
+Upgrading from 0.1:
+
+- `resources` is `topics`, and `authorize` returns the admitted topics instead of a boolean. A callback that still returns `true` fails every open.
+- Re-apply `sql/live_resource_notify.sql`; it replaces the function in place. Existing one-argument triggers keep working and publish keyless hints.
+- `useSnapshot` is gone. The view keeps its own state and joins with `useTopic`; a new server-rendered value is not applied to a mounted view, so remount with a `key` or call `refresh()` where the selection changes.
+- The 0.1 browser opens with `GET`. Route `GET` to `handle` as well until no such tab is left; the 400 it answers stops that client's retries.
 
 ## How it behaves
 
@@ -227,13 +235,13 @@ Upgrading from 0.1: the 0.1 browser opens with `GET`. Route `GET` to `handle` as
 
 **Hints are forwarded per join.** A notification marks the admitted joins it reaches, and the stream sends one `invalidate` per marked join, so a bulk update that publishes thousands of keys costs a keyless join one frame.
 
-**Reads are serialized per join.** A hint that arrives during a read marks the join dirty, and exactly one more read follows. A read is aborted after 30 seconds, and its lock is held until it settles, so a late completion cannot overlap its retry. A failed read reopens the stream before reading again.
+**Reads are serialized per join.** A hint that arrives during a read marks the join dirty, and exactly one more read follows. A read is aborted after 30 seconds, and its lock is held until it settles, so a late completion cannot overlap its retry. A failed read reopens the stream before reading again, with a backoff that resets only when a read lands, so one route that keeps failing is retried slower and slower rather than twice a second.
 
 **Recovery is split.** The server owns the database listener: it probes the connection, reconnects with backoff, and keeps browser streams open while it does, telling them `interrupted` and then `ready`. The browser owns the stream: it reconnects with backoff and treats 45 seconds of silence as a dead connection.
 
 **Hidden tabs.** A hidden tab with a healthy stream keeps receiving hints and rereading, so it is current the moment you switch back. A hidden tab whose stream breaks does not retry until it is visible again, and then attempts immediately with no accumulated backoff. A healthy return causes no extra open or read. The aim is visual stability and a fast return. The costs are background bandwidth for hidden tabs and no freshness promise after an outage or a browser suspension.
 
-**Bounds.** A stream that stops draining is closed at 64 queued frames. The browser rejects a frame buffer over 16 KiB. An open may carry at most 256 topics. The trigger costs a bulk write a few microseconds per row on Postgres 16 and scales linearly with the number of distinct keys; a wide row pays more for the unchanged-row comparison than for the key.
+**Bounds.** A stream that stops draining is closed at 64 queued batches, where one heartbeat's frames are one batch. The browser rejects an unterminated frame over 16 KiB. An open may carry at most 256 topics. Joins made in the same tick open one stream between them. The trigger costs a bulk write a few microseconds per row on Postgres 16 and scales linearly with the number of distinct keys; a wide row pays more for the unchanged-row comparison than for the key.
 
 These values are fixed. The protocol, including the `live_resource` channel and the `name key` form of a topic on it, is the contract between the two halves of the package and is not configurable.
 

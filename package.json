@@ -1,7 +1,7 @@
 {
   "name": "@usetemi/live-resource",
   "version": "0.2.0",
-  "description": "Keep Next.js views current from Postgres notifications over SSE, with authorized snapshot rereads.",
+  "description": "Keep Next.js views current from Postgres notifications over SSE, with authorized rereads.",
   "keywords": [
     "listen",
     "liveview",

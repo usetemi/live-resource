@@ -15,6 +15,8 @@ type Subscription = {
   controller?: AbortController;
 };
 
+const DENIED = "denied";
+
 /** The per-tab runtime: one shared stream, serialized reads, and recovery. */
 export function createRuntime(endpoint: string) {
   const subscriptions = new Set<Subscription>();
@@ -23,23 +25,31 @@ export function createRuntime(endpoint: string) {
   let carried = new Set<string>();
   const denied = new Set<string>();
   let source: AbortController | undefined;
+  let opening = false;
   let reconnect: ReturnType<typeof setTimeout> | undefined;
   let watchdog: ReturnType<typeof setTimeout> | undefined;
   let ready = false;
   let lastFrame = 0;
   let attempt = 0;
-  // Automatic retries stop on a denial or a rejected topic set until retry().
-  let halted: "unauthorized" | "rejected" | undefined;
+  // Automatic retries stop on a refused open until retry().
+  let halted = false;
 
-  function topicStatus(subscription: Subscription): LiveTopicStatus {
-    if (denied.has(subscription.encoded)) return "unauthorized";
-    return !ready || subscription.interrupted ? "reconnecting" : "connected";
+  function getTopicStatus(topic: LiveResourceTopic): LiveTopicStatus {
+    const encoded = encodeTopic(topic);
+    if (halted || denied.has(encoded)) return "unauthorized";
+    let joined = false;
+    for (const subscription of subscriptions) {
+      if (subscription.encoded !== encoded) continue;
+      joined = true;
+      if (subscription.interrupted) return "reconnecting";
+    }
+    return joined && ready ? "connected" : "reconnecting";
   }
 
   function getStatus(): LiveResourceStatus {
     if (!subscriptions.size) return "idle";
-    if (halted === "unauthorized") return "unauthorized";
-    const statuses = [...subscriptions].map(topicStatus);
+    if (halted) return "unauthorized";
+    const statuses = [...subscriptions].map((subscription) => getTopicStatus(subscription.topic));
     if (statuses.every((status) => status === "unauthorized")) return "unauthorized";
     return statuses.some((status) => status === "reconnecting") ? "reconnecting" : "connected";
   }
@@ -60,13 +70,14 @@ export function createRuntime(endpoint: string) {
   async function reread(subscription: Subscription) {
     subscription.dirty = true;
     if (subscription.controller || !ready || denied.has(subscription.encoded)) return;
+    let controller: AbortController | undefined;
     try {
       while (subscription.dirty && ready && subscriptions.has(subscription)) {
         subscription.dirty = false;
-        const controller = new AbortController();
+        controller = new AbortController();
         subscription.controller = controller;
         const timeout = setTimeout(() => {
-          controller.abort();
+          controller?.abort();
           if (subscriptions.has(subscription)) scheduleReconnect();
         }, 30_000);
         try {
@@ -78,14 +89,22 @@ export function createRuntime(endpoint: string) {
         }
       }
       if (ready && subscriptions.has(subscription)) {
+        // Backoff resets on a read that lands, not on a stream that opens, so a
+        // route that keeps failing is retried slower and slower.
+        attempt = 0;
         subscription.interrupted = false;
         publishStatus();
       }
     } catch {
-      // A read aborted by a denial of its own join is not a broken stream.
-      if (subscriptions.has(subscription) && !denied.has(subscription.encoded)) scheduleReconnect();
+      // A read the runtime aborted on a denial of its own join is not a broken stream.
+      if (controller?.signal.reason === DENIED) {
+        subscription.controller = undefined;
+        if (!denied.has(subscription.encoded)) void reread(subscription);
+        return;
+      }
+      if (subscriptions.has(subscription)) scheduleReconnect();
     } finally {
-      subscription.controller = undefined;
+      if (subscription.controller === controller) subscription.controller = undefined;
     }
   }
 
@@ -110,6 +129,7 @@ export function createRuntime(endpoint: string) {
     }
   }
 
+  // Joins made in one tick open one stream between them.
   function connect() {
     source?.abort();
     source = undefined;
@@ -119,6 +139,15 @@ export function createRuntime(endpoint: string) {
     carried = new Set();
     denied.clear();
     interrupt();
+    if (opening) return;
+    opening = true;
+    queueMicrotask(() => {
+      opening = false;
+      open();
+    });
+  }
+
+  function open() {
     if (!subscriptions.size || halted || document.visibilityState === "hidden") return;
     const connection = new AbortController();
     source = connection;
@@ -130,8 +159,8 @@ export function createRuntime(endpoint: string) {
       clearTimeout(watchdog);
       watchdog = setTimeout(scheduleReconnect, 45_000);
     }
-    function halt(reason: NonNullable<typeof halted>) {
-      halted = reason;
+    function halt() {
+      halted = true;
       connection.abort();
       source = undefined;
       clearTimeout(watchdog);
@@ -147,13 +176,11 @@ export function createRuntime(endpoint: string) {
         signal: connection.signal,
       });
       if (source !== connection) return;
-      if (response.status === 401 || response.status === 403) {
-        halt("unauthorized");
-        return;
-      }
       if (response.status === 400) {
-        console.error(`live-resource: ${endpoint} rejected [${[...carried].join(", ")}]`);
-        halt("rejected");
+        console.error(`live-resource: ${endpoint} rejected the open: ${await response.text()}`);
+      }
+      if (response.status === 400 || response.status === 401 || response.status === 403) {
+        halt();
         return;
       }
       if (!response.ok || !response.body) throw new Error("Subscription failed");
@@ -164,7 +191,6 @@ export function createRuntime(endpoint: string) {
           const chunk = await reader.read();
           if (source !== connection || chunk.done) break;
           buffer += chunk.value;
-          if (buffer.length > 16_384) throw new Error("Oversized subscription frame");
           let boundary: number;
           while ((boundary = buffer.indexOf("\n\n")) !== -1) {
             const frame = buffer.slice(0, boundary).split("\n");
@@ -175,14 +201,13 @@ export function createRuntime(endpoint: string) {
             if (type === "interrupted") interrupt();
             if (type === "ready") {
               ready = true;
-              attempt = 0;
               for (const subscription of subscriptions) void reread(subscription);
             }
             if (type === "invalidate")
               forEachJoin(data, (subscription) => void reread(subscription));
             if (type === "denied" && data !== undefined) {
               denied.add(data);
-              forEachJoin(data, (subscription) => subscription.controller?.abort());
+              forEachJoin(data, (subscription) => subscription.controller?.abort(DENIED));
               publishStatus();
             }
             if (type === "admitted" && data !== undefined) {
@@ -194,6 +219,8 @@ export function createRuntime(endpoint: string) {
               publishStatus();
             }
           }
+          // Whole frames are consumed above; only an unterminated one is bounded.
+          if (buffer.length > 16_384) throw new Error("Oversized subscription frame");
         }
       } finally {
         await reader.cancel().catch(() => {});
@@ -212,7 +239,7 @@ export function createRuntime(endpoint: string) {
       return;
     }
     if (source && Date.now() - lastFrame >= 45_000) scheduleReconnect();
-    if (!source && !halted) {
+    if (!source && !opening && !halted) {
       attempt = 0;
       connect();
     }
@@ -220,6 +247,7 @@ export function createRuntime(endpoint: string) {
 
   return {
     getStatus,
+    getTopicStatus,
     subscribeStatus(listener: () => void) {
       statusListeners.add(listener);
       return () => {
@@ -228,7 +256,7 @@ export function createRuntime(endpoint: string) {
     },
     /** Reopen and catch up without navigating or changing unsaved page state. */
     retry() {
-      halted = undefined;
+      halted = false;
       attempt = 0;
       connect();
     },
@@ -256,7 +284,6 @@ export function createRuntime(endpoint: string) {
       if (carried.has(subscription.encoded)) void reread(subscription);
       else connect();
       return {
-        getStatus: () => topicStatus(subscription),
         /** Coalesces with hints: at most one more read follows the current one. */
         refresh() {
           if (subscriptions.has(subscription)) void reread(subscription);
@@ -269,7 +296,7 @@ export function createRuntime(endpoint: string) {
             window.removeEventListener("pageshow", resume);
             window.removeEventListener("online", resume);
             window.removeEventListener("offline", scheduleReconnect);
-            halted = undefined;
+            halted = false;
             attempt = 0;
             connect();
           }

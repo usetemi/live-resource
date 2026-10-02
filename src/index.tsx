@@ -70,14 +70,15 @@ export function useTopic(
   read: LiveResourceRead
 ): { status: LiveTopicStatus; refresh: () => void } {
   const { name, key } = typeof topic === "string" ? { name: topic } : topic;
-  if (!isTopic({ name, key })) throw new Error(`Invalid live resource topic: ${name} ${key}`);
+  if (!isTopic({ name, key })) {
+    throw new Error(`Invalid live resource topic ${JSON.stringify({ name, key })}`);
+  }
   const runtime = useRuntime();
   const join = useRef<Join | undefined>(undefined);
   const latest = useEffectEvent((signal: AbortSignal) => read(signal));
-  // Subscribed to status before the join exists, so the join's first publish is heard.
   const status = useSyncExternalStore(
     runtime.subscribeStatus,
-    (): LiveTopicStatus => join.current?.getStatus() ?? "reconnecting",
+    (): LiveTopicStatus => runtime.getTopicStatus({ name, key }),
     (): LiveTopicStatus => "reconnecting"
   );
 

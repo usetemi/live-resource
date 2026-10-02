@@ -17,6 +17,11 @@
 -- one the stream cannot carry (empty, over 256 characters, or holding a control
 -- character) is forwarded keyless instead, so no join misses the change.
 --
+-- The trigger must be AFTER and, with a key column, FOR EACH ROW; the function
+-- raises otherwise, because a BEFORE trigger returning null would drop the write.
+-- Row triggers do not fire on TRUNCATE; a keyless
+-- `AFTER TRUNCATE ON tasks FOR EACH STATEMENT` trigger covers it where needed.
+--
 -- Postgres delivers the notification only after commit, drops it on rollback,
 -- and coalesces identical notifications within one transaction.
 CREATE OR REPLACE FUNCTION live_resource_notify() RETURNS trigger AS $$
@@ -24,7 +29,12 @@ DECLARE
   old_key text;
   new_key text;
 BEGIN
-  IF TG_OP = 'UPDATE' AND OLD IS NOT DISTINCT FROM NEW THEN
+  IF TG_WHEN <> 'AFTER' OR (TG_LEVEL <> 'ROW' AND TG_NARGS >= 2) THEN
+    RAISE EXCEPTION 'live_resource_notify must be an AFTER trigger, FOR EACH ROW when it names a key column';
+  END IF;
+  -- Compared as text: a record comparison needs an equality operator for every
+  -- column, which json and some other types lack.
+  IF TG_LEVEL = 'ROW' AND TG_OP = 'UPDATE' AND OLD::text IS NOT DISTINCT FROM NEW::text THEN
     RETURN NULL;
   END IF;
   IF TG_NARGS < 2 THEN

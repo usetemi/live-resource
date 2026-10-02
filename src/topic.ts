@@ -2,9 +2,9 @@
 export type LiveResourceTopic = { name: string; key?: string };
 
 export const TOPIC_NAME = /^[a-z][a-z0-9_]{0,63}$/;
-/** Printable, at most 256 characters: a key travels on one SSE data line. */
+/** Printable, 1 to 256 code points: a key travels on one SSE data line. */
 // oxlint-disable-next-line no-control-regex
-export const TOPIC_KEY = /^[^\x00-\x1F\x7F]{1,256}$/;
+export const TOPIC_KEY = /^[^\x00-\x1F\x7F]{1,256}$/u;
 
 /** The one text form a topic takes on the NOTIFY channel and on the stream: `name` or `name key`. */
 export function encodeTopic({ name, key }: LiveResourceTopic): string {

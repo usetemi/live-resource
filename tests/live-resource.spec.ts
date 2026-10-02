@@ -157,11 +157,39 @@ test("anonymous viewers cannot join, and a malformed open is refused", async ({
 }) => {
   const open = (topics: unknown) => request.post("/api/live", { data: { topics } });
   expect((await open([{ name: "tasks" }])).status()).toBe(403);
-  expect((await open([{ name: "undeclared" }])).status()).toBe(400);
+  // An undeclared name is a denied join, not a broken open; alone it admits nothing.
+  expect((await open([{ name: "undeclared" }])).status()).toBe(403);
   expect((await open([{ name: "notes", key: "a\nb" }])).status()).toBe(400);
   expect((await request.get("/api/live?resource=tasks")).status()).toBe(400);
   await page.goto("/");
   await expect(status(page)).toHaveText("unauthorized");
+  await expect(page.getByLabel("Tasks status")).toHaveText("unauthorized");
+});
+
+test("the trigger publishes the key a row leaves and the one it enters, and skips an unchanged row", async ({
+  db,
+  marker,
+}) => {
+  const heard: string[] = [];
+  db.on("notification", ({ payload }) => {
+    if (payload?.includes(marker)) heard.push(payload);
+  });
+  await db.query("LISTEN live_resource");
+  await db.query("INSERT INTO notes (viewer, body) VALUES ($1, 'a')", [`${marker}-1`]);
+  await db.query("UPDATE notes SET viewer = $2 WHERE viewer = $1", [`${marker}-1`, `${marker}-2`]);
+  await db.query("UPDATE notes SET body = 'b' WHERE viewer = $1", [`${marker}-2`]);
+  await db.query("UPDATE notes SET body = 'b' WHERE viewer = $1", [`${marker}-2`]);
+  await db.query("DELETE FROM notes WHERE viewer = $1", [`${marker}-2`]);
+  await expect
+    .poll(() => heard)
+    .toEqual([
+      `notes ${marker}-1`,
+      `notes ${marker}-1`,
+      `notes ${marker}-2`,
+      `notes ${marker}-2`,
+      `notes ${marker}-2`,
+    ]);
+  await db.query("UNLISTEN live_resource");
 });
 
 test("a lost database listener recovers and catches up on what it missed", async ({
