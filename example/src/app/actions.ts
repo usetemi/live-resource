@@ -1,9 +1,12 @@
 "use server";
 
+import { cookies } from "next/headers";
+
 import { db } from "@/db";
+import { viewerName } from "@/viewer";
 
 // Writes are ordinary Server Actions. The committed row fires the table's trigger,
-// so every subscribed tab rereads; the action does not revalidate or notify anything.
+// so every joined tab rereads; the action does not revalidate or notify anything.
 export async function addTask(formData: FormData) {
   const title = String(formData.get("title") ?? "").trim();
   if (title) await db.query("INSERT INTO tasks (title) VALUES ($1)", [title]);
@@ -15,5 +18,8 @@ export async function toggleTask(id: number) {
 
 export async function addNote(formData: FormData) {
   const body = String(formData.get("body") ?? "").trim();
-  if (body) await db.query("INSERT INTO notes (body) VALUES ($1)", [body]);
+  const viewer = viewerName((await cookies()).toString());
+  if (body && viewer) {
+    await db.query("INSERT INTO notes (viewer, body) VALUES ($1, $2)", [viewer, body]);
+  }
 }

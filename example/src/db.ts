@@ -16,6 +16,8 @@ export async function readTasks() {
   return (await db.query<Task>("SELECT id, title, done FROM tasks ORDER BY id")).rows;
 }
 
-export async function readNotes() {
-  return (await db.query<Note>("SELECT id, body FROM notes ORDER BY id")).rows;
+export async function readNotes(viewer: string) {
+  return (
+    await db.query<Note>("SELECT id, body FROM notes WHERE viewer = $1 ORDER BY id", [viewer])
+  ).rows;
 }

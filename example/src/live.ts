@@ -9,9 +9,16 @@ declare global {
 function create() {
   const server = createLiveResourceServer({
     connectionString: process.env.DIRECT_DATABASE_URL ?? process.env.DATABASE_URL!,
-    resources: ["tasks", "notes"],
-    authorize: async (request) => (await findViewer(request))?.allowed === true,
-    log: (event) => console[event.level](`live-resource: ${event.name}`),
+    topics: ["tasks", "notes"],
+    // Every allowed viewer may join tasks; a viewer may join notes with their own key only.
+    authorize: async (request, topics) => {
+      const viewer = await findViewer(request);
+      if (!viewer) return [];
+      return topics.filter(({ name, key }) =>
+        name === "tasks" ? viewer.allowed : name === "notes" && key === viewer.name
+      );
+    },
+    log: (event) => console[event.level](`live-resource: ${event.name}`, event.detail ?? ""),
   });
   process.once("SIGTERM", () => void server.close());
   return server;

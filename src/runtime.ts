@@ -1,38 +1,47 @@
-export type LiveResourceStatus = "idle" | "connected" | "reconnecting" | "unauthorized";
+import { encodeTopic, type LiveResourceTopic } from "./topic.js";
 
-/** Apply the snapshot before resolving, reject failures, and honor the signal before applying. */
+export type LiveResourceStatus = "idle" | "connected" | "reconnecting" | "unauthorized";
+export type LiveTopicStatus = "connected" | "reconnecting" | "unauthorized";
+
+/** Apply the result before resolving, reject failures, and honor the signal before applying. */
 export type LiveResourceRead = (signal: AbortSignal) => Promise<void>;
 
 type Subscription = {
-  resource: string;
+  topic: LiveResourceTopic;
+  encoded: string;
   read: LiveResourceRead;
   interrupted: boolean;
   dirty: boolean;
   controller?: AbortController;
 };
 
-export const RESOURCE_NAME = /^[a-z][a-z0-9_]{0,63}$/;
-
 /** The per-tab runtime: one shared stream, serialized reads, and recovery. */
 export function createRuntime(endpoint: string) {
   const subscriptions = new Set<Subscription>();
   const statusListeners = new Set<() => void>();
+  // Topics the open stream carries, and those it has refused since it opened.
   let carried = new Set<string>();
+  const denied = new Set<string>();
   let source: AbortController | undefined;
   let reconnect: ReturnType<typeof setTimeout> | undefined;
   let watchdog: ReturnType<typeof setTimeout> | undefined;
   let ready = false;
   let lastFrame = 0;
   let attempt = 0;
-  // Automatic retries stop on a denial or a rejected resource set until retry().
+  // Automatic retries stop on a denial or a rejected topic set until retry().
   let halted: "unauthorized" | "rejected" | undefined;
+
+  function topicStatus(subscription: Subscription): LiveTopicStatus {
+    if (denied.has(subscription.encoded)) return "unauthorized";
+    return !ready || subscription.interrupted ? "reconnecting" : "connected";
+  }
 
   function getStatus(): LiveResourceStatus {
     if (!subscriptions.size) return "idle";
     if (halted === "unauthorized") return "unauthorized";
-    return !ready || [...subscriptions].some((subscription) => subscription.interrupted)
-      ? "reconnecting"
-      : "connected";
+    const statuses = [...subscriptions].map(topicStatus);
+    if (statuses.every((status) => status === "unauthorized")) return "unauthorized";
+    return statuses.some((status) => status === "reconnecting") ? "reconnecting" : "connected";
   }
 
   function publishStatus() {
@@ -50,7 +59,7 @@ export function createRuntime(endpoint: string) {
 
   async function reread(subscription: Subscription) {
     subscription.dirty = true;
-    if (subscription.controller || !ready) return;
+    if (subscription.controller || !ready || denied.has(subscription.encoded)) return;
     try {
       while (subscription.dirty && ready && subscriptions.has(subscription)) {
         subscription.dirty = false;
@@ -94,6 +103,12 @@ export function createRuntime(endpoint: string) {
     );
   }
 
+  function forEachJoin(encoded: string | undefined, apply: (subscription: Subscription) => void) {
+    for (const subscription of subscriptions) {
+      if (subscription.encoded === encoded) apply(subscription);
+    }
+  }
+
   function connect() {
     source?.abort();
     source = undefined;
@@ -101,11 +116,14 @@ export function createRuntime(endpoint: string) {
     clearTimeout(watchdog);
     reconnect = undefined;
     carried = new Set();
+    denied.clear();
     interrupt();
     if (!subscriptions.size || halted || document.visibilityState === "hidden") return;
     const connection = new AbortController();
     source = connection;
-    carried = new Set([...subscriptions].map((subscription) => subscription.resource));
+    const topics = new Map<string, LiveResourceTopic>();
+    for (const subscription of subscriptions) topics.set(subscription.encoded, subscription.topic);
+    carried = new Set(topics.keys());
     function alive() {
       lastFrame = Date.now();
       clearTimeout(watchdog);
@@ -121,16 +139,19 @@ export function createRuntime(endpoint: string) {
     // Bound opening a connection as well as silence between received frames.
     alive();
     void (async () => {
-      const url = new URL(endpoint, window.location.href);
-      for (const resource of [...carried].sort()) url.searchParams.append("resource", resource);
-      const response = await fetch(url, { signal: connection.signal });
+      const response = await fetch(new URL(endpoint, window.location.href), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ topics: [...topics.values()] }),
+        signal: connection.signal,
+      });
       if (source !== connection) return;
       if (response.status === 401 || response.status === 403) {
         halt("unauthorized");
         return;
       }
       if (response.status === 400) {
-        console.error(`live-resource: ${endpoint} does not declare [${[...carried].join(", ")}]`);
+        console.error(`live-resource: ${endpoint} rejected [${[...carried].join(", ")}]`);
         halt("rejected");
         return;
       }
@@ -150,20 +171,26 @@ export function createRuntime(endpoint: string) {
             const type = frame.find((line) => line.startsWith("event: "))?.slice(7);
             const data = frame.find((line) => line.startsWith("data: "))?.slice(6);
             alive();
-            if (type === "unauthorized") {
-              halt("unauthorized");
-              return;
-            }
             if (type === "interrupted") interrupt();
             if (type === "ready") {
               ready = true;
               attempt = 0;
               for (const subscription of subscriptions) void reread(subscription);
             }
-            if (type === "invalidate") {
-              for (const subscription of subscriptions) {
-                if (subscription.resource === data) void reread(subscription);
-              }
+            if (type === "invalidate")
+              forEachJoin(data, (subscription) => void reread(subscription));
+            if (type === "denied" && data !== undefined) {
+              denied.add(data);
+              forEachJoin(data, (subscription) => subscription.controller?.abort());
+              publishStatus();
+            }
+            if (type === "admitted" && data !== undefined) {
+              denied.delete(data);
+              forEachJoin(data, (subscription) => {
+                subscription.interrupted = true;
+                void reread(subscription);
+              });
+              publishStatus();
             }
           }
         }
@@ -198,19 +225,25 @@ export function createRuntime(endpoint: string) {
         statusListeners.delete(listener);
       };
     },
-    /** Resubscribe and catch up without navigating or changing unsaved page state. */
+    /** Reopen and catch up without navigating or changing unsaved page state. */
     retry() {
       halted = undefined;
       attempt = 0;
       connect();
     },
     /**
-     * Subscribers share one stream. A name the stream already carries rereads
-     * only; a new name reconnects with the full set, and everyone catches up on
-     * ready, so every read still follows its subscription.
+     * Joins share one stream. A topic the stream already carries rereads only; a
+     * new topic reopens with the full set, and everyone catches up on ready, so
+     * every read still follows its join.
      */
-    subscribe(resource: string, read: LiveResourceRead) {
-      const subscription: Subscription = { resource, read, interrupted: true, dirty: true };
+    subscribe(topic: LiveResourceTopic, read: LiveResourceRead) {
+      const subscription: Subscription = {
+        topic,
+        encoded: encodeTopic(topic),
+        read,
+        interrupted: true,
+        dirty: true,
+      };
       if (!subscriptions.size) {
         document.addEventListener("visibilitychange", resume);
         window.addEventListener("pageshow", resume);
@@ -219,10 +252,11 @@ export function createRuntime(endpoint: string) {
       }
       subscriptions.add(subscription);
       publishStatus();
-      if (carried.has(resource)) void reread(subscription);
+      if (carried.has(subscription.encoded)) void reread(subscription);
       else connect();
       return {
-        /** Coalesces with database hints: at most one more read follows the current one. */
+        getStatus: () => topicStatus(subscription),
+        /** Coalesces with hints: at most one more read follows the current one. */
         refresh() {
           if (subscriptions.has(subscription)) void reread(subscription);
         },
